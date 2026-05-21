@@ -5752,6 +5752,9 @@ class VideoSubtitleRemoverApp:
                                 font=f(Theme.F_META), bg=Theme.BG_OVERLAY, fg=Theme.TEXT_SECONDARY)
             time_lbl.pack(side="left", padx=(0, Theme.S_MD))
 
+            # Reference to store the active Tkinter timer for SAM embedding debouncing
+            self._sam_embed_timer = None
+
             def on_timeline_scroll(val_str):
                 idx = int(float(val_str))
                 new_f = get_frame_at_index(idx)
@@ -5761,19 +5764,32 @@ class VideoSubtitleRemoverApp:
                     cur_time_str = format_time(idx, fps)
                     time_lbl.config(text=f"{cur_time_str} / {total_time_str} (Frame {idx}/{total_frames-1})")
                     
+                    # Debounce the heavy CUDA SAM embedding calculation to avoid spawning overlapping threads on fast dragging
                     if win_state["sam_ready"] and win_state["segmentor"] is not None:
-                        sam_status_label.config(text="✨ SAM: Embedding new frame...", fg=Theme.BLUE_PRIMARY)
-                        
-                        def update_sam_embeddings():
-                            try:
-                                if win_state["segmentor"] is not None:
-                                    win_state["segmentor"].set_image(new_f)
-                                    if win.winfo_exists():
-                                        win.after(0, lambda: sam_status_label.config(text="✨ SAM: Ready", fg=Theme.SUCCESS))
-                            except Exception as ex:
-                                logger.error(f"Failed to update SAM embeddings: {ex}")
-                                
-                        threading.Thread(target=update_sam_embeddings, daemon=True).start()
+                        if self._sam_embed_timer:
+                            win.after_cancel(self._sam_embed_timer)
+                            self._sam_embed_timer = None
+
+                        def trigger_update():
+                            self._sam_embed_timer = None
+                            if not win.winfo_exists():
+                                return
+                            sam_status_label.config(text="✨ SAM: Embedding new frame...", fg=Theme.BLUE_PRIMARY)
+                            
+                            def update_sam_embeddings_thread():
+                                try:
+                                    # Ensure we are still looking at the same frame when the thread runs
+                                    if win.winfo_exists() and win_state["current_frame_rgb"] is new_f:
+                                        if win_state["segmentor"] is not None:
+                                            win_state["segmentor"].set_image(new_f)
+                                            if win.winfo_exists() and win_state["current_frame_rgb"] is new_f:
+                                                win.after(0, lambda: sam_status_label.config(text="✨ SAM: Ready", fg=Theme.SUCCESS))
+                                except Exception as ex:
+                                    logger.error(f"Failed to update SAM embeddings: {ex}")
+                                    
+                            threading.Thread(target=update_sam_embeddings_thread, daemon=True).start()
+
+                        self._sam_embed_timer = win.after(350, trigger_update)
 
             timeline_slider = ModernSlider(timeline_frame, from_=0, to=total_frames - 1, value=0, bg=Theme.BG_OVERLAY)
             timeline_slider.pack(side="left", fill="x", expand=True)
