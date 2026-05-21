@@ -797,5 +797,220 @@ class LoadJsonConfigTests(unittest.TestCase):
                 processor._load_json_config(str(big))
 
 
+class LamaCropOptimisationTests(unittest.TestCase):
+    """`_lama_bbox_with_padding`, `_LamaCropCache`, and `_lama_run_one` are the
+    three building blocks of the LaMa speed-up. They must:
+
+    1. Pick a tight padded bbox when the mask is sparse, and bail out (return
+       None) when the bbox would cover most of the frame.
+    2. Composite the inpainted crop back into a full-frame canvas whose
+       unmasked pixels are byte-identical to the input frame.
+    3. Be a no-op (legacy full-frame path) when `padding == 0`.
+    4. Reuse a cached forward pass when bbox + cropped pHash match within the
+       configured Hamming distance, and miss when they don't.
+    """
+
+    @staticmethod
+    def _frame(h=480, w=640, fill=64):
+        import numpy as np
+        rng = np.random.default_rng(0)
+        f = rng.integers(0, 255, (h, w, 3), dtype=np.uint8)
+        # Stamp a recognisable pattern so we can tell whether unmasked pixels
+        # have been corrupted.
+        f[:, :8] = fill
+        f[:, -8:] = fill
+        return f
+
+    @staticmethod
+    def _mask(h=480, w=640, y1=420, y2=460, x1=80, x2=560):
+        import numpy as np
+        m = np.zeros((h, w), dtype=np.uint8)
+        m[y1:y2, x1:x2] = 255
+        return m
+
+    def test_bbox_with_padding_clamps_to_frame_and_pads(self):
+        m = self._mask()
+        bbox = processor._lama_bbox_with_padding(m, (480, 640), padding=32)
+        self.assertIsNotNone(bbox)
+        x1, y1, x2, y2 = bbox
+        # Padding shifts each edge outward but stays in-bounds.
+        self.assertEqual(x1, 80 - 32)
+        self.assertEqual(y1, 420 - 32)
+        self.assertEqual(x2, 560 + 32)
+        # Bottom edge would be 460+32=492 but clamps at frame height 480.
+        self.assertEqual(y2, 480)
+
+    def test_bbox_returns_none_when_mask_empty(self):
+        import numpy as np
+        m = np.zeros((100, 200), dtype=np.uint8)
+        self.assertIsNone(processor._lama_bbox_with_padding(m, (100, 200), padding=8))
+
+    def test_bbox_returns_none_when_mask_covers_most_of_frame(self):
+        import numpy as np
+        m = np.full((100, 200), 255, dtype=np.uint8)
+        # Whole frame masked -> bbox would equal frame area; skip the crop.
+        self.assertIsNone(processor._lama_bbox_with_padding(m, (100, 200), padding=8))
+
+    def test_bbox_with_padding_zero_returns_tight_bbox(self):
+        # padding=0 is still a meaningful crop -- the *caller* (_lama_run_one)
+        # decides to skip cropping for padding=0; the helper itself just
+        # returns the tightest possible bbox.
+        m = self._mask()
+        bbox = processor._lama_bbox_with_padding(m, (480, 640), padding=0)
+        self.assertEqual(bbox, (80, 420, 560, 460))
+
+    def test_run_one_zero_padding_uses_full_frame_path(self):
+        f = self._frame()
+        m = self._mask()
+        seen = {}
+
+        def fake_lama(image, mask):
+            seen["w"], seen["h"] = image.size
+            return image  # pretend the network is identity
+
+        out = processor._lama_run_one(fake_lama, f, m, padding=0, cache=None)
+        self.assertEqual(out.shape, f.shape)
+        # padding=0 -> full-frame call: image was the whole frame.
+        self.assertEqual(seen, {"w": f.shape[1], "h": f.shape[0]})
+
+    def test_run_one_with_padding_passes_smaller_crop_and_composites(self):
+        import numpy as np
+        f = self._frame()
+        m = self._mask()
+        seen = {}
+
+        def fake_lama(image, mask):
+            seen["w"], seen["h"] = image.size
+            # Return a solid colour so we can verify only masked pixels were
+            # overwritten.
+            from PIL import Image
+            return Image.new("RGB", image.size, color=(255, 0, 255))
+
+        out = processor._lama_run_one(fake_lama, f, m, padding=16, cache=None)
+        # The fake LaMa was handed a strict subset of the frame.
+        self.assertLess(seen["w"], f.shape[1])
+        self.assertLess(seen["h"], f.shape[0])
+        # Outside the bbox, output must be byte-identical to the input.
+        bbox = processor._lama_bbox_with_padding(m, f.shape, padding=16)
+        x1, y1, x2, y2 = bbox
+        np.testing.assert_array_equal(out[:y1], f[:y1])
+        np.testing.assert_array_equal(out[y2:], f[y2:])
+        np.testing.assert_array_equal(out[y1:y2, :x1], f[y1:y2, :x1])
+        np.testing.assert_array_equal(out[y1:y2, x2:], f[y1:y2, x2:])
+
+    def test_run_one_with_cache_reuses_forward_pass_on_repeat_frames(self):
+        f = self._frame()
+        m = self._mask()
+        calls = {"n": 0}
+
+        def fake_lama(image, mask):
+            calls["n"] += 1
+            from PIL import Image
+            return Image.new("RGB", image.size, color=(0, 200, 0))
+
+        cache = processor._LamaCropCache(max_entries=4, distance_threshold=2)
+        # First call: miss -> runs LaMa.
+        processor._lama_run_one(fake_lama, f, m, padding=16, cache=cache)
+        # Second call with the same frame + mask: hit -> reuses the cached crop.
+        processor._lama_run_one(fake_lama, f, m, padding=16, cache=cache)
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(cache.hits, 1)
+        self.assertEqual(cache.misses, 1)
+
+    def test_bbox_seeded_from_subtitle_area_is_stable_across_frames(self):
+        # The whole point of seeding from `subtitle_area`: every frame gets the
+        # *same* padded bbox, so the LRU cache hits regardless of how the
+        # per-frame OCR mask drifts.
+        h, w = 480, 640
+        area = (200, 400, 500, 460)
+        bboxes = set()
+        # Drift the mask strictly within the subtitle_area (220..480 horizontal,
+        # 410..450 vertical). All masks land inside, so the bbox is stable.
+        for x_offset in range(0, 20, 5):
+            m = self._mask(h=h, w=w, y1=410, y2=450,
+                            x1=220 + x_offset, x2=460 + x_offset)
+            bbox = processor._lama_bbox_with_padding(
+                m, (h, w), padding=16, subtitle_area=area,
+            )
+            bboxes.add(bbox)
+        # All frames must collapse to one stable bbox.
+        self.assertEqual(len(bboxes), 1, f"unexpected drift: {bboxes}")
+        bbox = bboxes.pop()
+        # And that bbox must be `subtitle_area` plus 16 px padding, clamped.
+        x1, y1, x2, y2 = bbox
+        self.assertEqual(x1, max(0, 200 - 16))
+        self.assertEqual(y1, max(0, 400 - 16))
+        self.assertEqual(x2, min(w, 500 + 16))
+        self.assertEqual(y2, min(h, 460 + 16))
+
+    def test_bbox_seeded_from_subtitle_area_expands_when_mask_overflows(self):
+        # If mask dilation pushes pixels outside `subtitle_area`, the bbox
+        # must expand to cover them -- correctness beats cache stability.
+        h, w = 480, 640
+        area = (200, 400, 500, 440)
+        # Mask extends 30 px below the region's bottom edge.
+        m = self._mask(h=h, w=w, y1=410, y2=470, x1=220, x2=480)
+        bbox = processor._lama_bbox_with_padding(
+            m, (h, w), padding=0, subtitle_area=area,
+        )
+        self.assertIsNotNone(bbox)
+        _, _, _, y2 = bbox
+        # bbox must extend to at least the bottom of the mask (470), not be
+        # clipped at `subtitle_area`'s bottom (440).
+        self.assertGreaterEqual(y2, 470)
+
+    def test_bbox_seeded_from_multi_region_unions_all_rects(self):
+        # `subtitle_areas` takes precedence over `subtitle_area` and the bbox
+        # must span the union of all rects.
+        h, w = 480, 640
+        rects = [(50, 50, 150, 90), (400, 400, 580, 440)]
+        # Mask only inside the first rect.
+        m = self._mask(h=h, w=w, y1=60, y2=80, x1=60, x2=140)
+        bbox = processor._lama_bbox_with_padding(
+            m, (h, w), padding=0, subtitle_areas=rects,
+        )
+        self.assertEqual(bbox, (50, 50, 580, 440))
+
+    def test_run_one_with_subtitle_area_lifts_cache_hit_rate(self):
+        # Two frames with the same subtitle_area but slightly different mask
+        # shapes must still hit the cache once seeded by subtitle_area.
+        f = self._frame()
+        m1 = self._mask(y1=420, y2=460, x1=80, x2=560)
+        m2 = self._mask(y1=420, y2=460, x1=100, x2=540)   # mask drifted
+        area = (50, 410, 590, 470)                          # fixed region
+        calls = {"n": 0}
+
+        def fake_lama(image, mask):
+            calls["n"] += 1
+            from PIL import Image
+            return Image.new("RGB", image.size, color=(0, 0, 0))
+
+        cache = processor._LamaCropCache(max_entries=4, distance_threshold=2)
+        processor._lama_run_one(fake_lama, f, m1, padding=16,
+                                 cache=cache, subtitle_area=area)
+        processor._lama_run_one(fake_lama, f, m2, padding=16,
+                                 cache=cache, subtitle_area=area)
+        self.assertEqual(calls["n"], 1, "second frame should hit the cache")
+        self.assertEqual(cache.hits, 1)
+        self.assertEqual(cache.misses, 1)
+
+    def test_run_one_with_cache_misses_on_different_bbox(self):
+        f = self._frame()
+        m1 = self._mask(y1=420, y2=460, x1=80, x2=560)
+        m2 = self._mask(y1=300, y2=340, x1=80, x2=560)  # different y range
+        calls = {"n": 0}
+
+        def fake_lama(image, mask):
+            calls["n"] += 1
+            from PIL import Image
+            return Image.new("RGB", image.size, color=(0, 0, 0))
+
+        cache = processor._LamaCropCache(max_entries=4, distance_threshold=64)
+        processor._lama_run_one(fake_lama, f, m1, padding=8, cache=cache)
+        processor._lama_run_one(fake_lama, f, m2, padding=8, cache=cache)
+        # Different bboxes -> two real forward passes.
+        self.assertEqual(calls["n"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

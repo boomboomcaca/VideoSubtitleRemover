@@ -167,13 +167,12 @@ def install_pytorch(gpu_info):
     pip = get_pip_command()
     
     try:
-        # torch >= 2.10.0 patches CVE-2026-24747 / CVE-2025-32434
-        # (torch.load weights_only RCE in 2.9.1 and earlier).
+        # Installing PyTorch compatible version (2.7.0/2.7.1 is latest on Python 3.13 for CUDA 11.8)
         if gpu_info["nvidia"]:
             print(f"  Installing PyTorch with CUDA support...")
             subprocess.run([
                 pip, 'install',
-                'torch>=2.10.0', 'torchvision>=0.25.0',
+                'torch>=2.7.0', 'torchvision>=0.22.0',
                 '--index-url', 'https://download.pytorch.org/whl/cu118'
             ], check=True)
         elif gpu_info["amd"] or gpu_info["intel"]:
@@ -190,7 +189,7 @@ def install_pytorch(gpu_info):
             print(f"  Installing PyTorch CPU version...")
             subprocess.run([
                 pip, 'install',
-                'torch>=2.10.0', 'torchvision>=0.25.0',
+                'torch>=2.7.0', 'torchvision>=0.22.0',
                 '--index-url', 'https://download.pytorch.org/whl/cpu'
             ], check=True)
         
@@ -237,7 +236,7 @@ def install_dependencies():
 
     try:
         print("  Refreshing packaging tools...")
-        subprocess.run([pip, 'install', '--upgrade', 'pip', 'setuptools', 'wheel'], check=True)
+        subprocess.run([get_python_command(), '-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'], check=True)
 
         if REQUIREMENTS_FILE.exists():
             print(f"  Installing dependencies from {REQUIREMENTS_FILE}...")

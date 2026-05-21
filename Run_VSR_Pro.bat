@@ -3,10 +3,8 @@ setlocal EnableDelayedExpansion
 
 title Video Subtitle Remover Pro
 
-:: Change to script directory
 cd /d "%~dp0"
 
-:: Check if venv exists
 if not exist "venv\Scripts\python.exe" (
     echo.
     echo  ============================================================

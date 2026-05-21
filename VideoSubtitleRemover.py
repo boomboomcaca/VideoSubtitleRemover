@@ -1222,7 +1222,7 @@ class Tooltip:
                 bg=Theme.BG_RAISED,
                 fg=Theme.TEXT_PRIMARY,
                 padx=10, pady=6,
-                wraplength=360,
+                wraplength=_scaled(self.widget.winfo_toplevel(), 360),
                 justify="left",
             ).pack()
             self._tip.update_idletasks()
@@ -1265,23 +1265,27 @@ class ModernButton(tk.Canvas):
                  bg=None, hover_bg=None, fg=Theme.TEXT_PRIMARY,
                  corner_radius=None, font_size=None, style="primary",
                  size="md", icon=None, **kwargs):
+        root = parent.winfo_toplevel()
+        scaled_width = _scaled(root, width)
         if height is None:
             height = self.SIZES.get(size, self.SIZES["md"])[0]
+        scaled_height = _scaled(root, height)
         if font_size is None:
             font_size = self.SIZES.get(size, self.SIZES["md"])[1]
         if corner_radius is None:
             corner_radius = Theme.R_MD if height <= 30 else Theme.R_LG
+        scaled_corner_radius = _scaled(root, corner_radius)
 
         parent_bg = parent.cget('bg') if hasattr(parent, 'cget') else Theme.BG_DARK
-        super().__init__(parent, width=width, height=height, highlightthickness=0,
+        super().__init__(parent, width=scaled_width, height=scaled_height, highlightthickness=0,
                         bg=parent_bg, takefocus=1)
 
         self.text = text
         self.icon = icon  # optional single-char glyph (ASCII)
         self.command = command
-        self.width = width
-        self.height = height
-        self.corner_radius = corner_radius
+        self.width = scaled_width
+        self.height = scaled_height
+        self.corner_radius = scaled_corner_radius
         self.font_size = font_size
         self.enabled = True
         self.focused = False
@@ -1486,14 +1490,18 @@ class ModernProgressBar(tk.Canvas):
 
     def __init__(self, parent, width=400, height=6, bg=Theme.PROGRESS_BG,
                  fill=Theme.PROGRESS_FILL, corner_radius=None, **kwargs):
+        root = parent.winfo_toplevel()
+        scaled_width = _scaled(root, width)
+        scaled_height = _scaled(root, height)
         if corner_radius is None:
-            corner_radius = max(2, height // 2)
-        super().__init__(parent, width=width, height=height, highlightthickness=0,
+            corner_radius = max(2, scaled_height // 2)
+        scaled_corner_radius = _scaled(root, corner_radius)
+        super().__init__(parent, width=scaled_width, height=scaled_height, highlightthickness=0,
                         bg=parent.cget('bg') if hasattr(parent, 'cget') else Theme.BG_DARK)
 
-        self.bar_width = width
-        self.bar_height = height
-        self.corner_radius = corner_radius
+        self.bar_width = scaled_width
+        self.bar_height = scaled_height
+        self.corner_radius = scaled_corner_radius
         self.bg_color = bg
         self.fill_color = fill
         self.progress = 0.0
@@ -1583,6 +1591,9 @@ class ModernToggle(tk.Canvas):
 
     def __init__(self, parent, text="", variable=None, command=None,
                  bg=None, fg=None, **kwargs):
+        root = parent.winfo_toplevel()
+        self.BOX = _scaled(root, 18)
+        self.GAP = _scaled(root, 10)
         self.variable = variable if variable is not None else tk.BooleanVar(value=False)
         self.text = text
         self.command = command
@@ -1596,7 +1607,7 @@ class ModernToggle(tk.Canvas):
         self._font = f(Theme.F_BODY_SM)
         text_w = tkfont.Font(font=self._font).measure(text)
         total_w = self.BOX + self.GAP + text_w + 4
-        super().__init__(parent, width=total_w, height=max(self.BOX + 4, 24),
+        super().__init__(parent, width=total_w, height=max(self.BOX + 4, _scaled(root, 24)),
                          highlightthickness=0, bg=self.parent_bg, takefocus=1)
 
         self._draw()
@@ -1847,12 +1858,12 @@ def show_confirm(parent, title: str, message: str, detail: str = "",
              anchor="w", justify="left").pack(anchor="w")
     tk.Label(content, text=message, font=f(Theme.F_BODY),
              bg=Theme.BG_SECONDARY, fg=Theme.TEXT_SECONDARY,
-             anchor="w", justify="left", wraplength=420).pack(
+             anchor="w", justify="left", wraplength=_scaled(parent, 420)).pack(
                  anchor="w", pady=(6, 0))
     if detail:
         tk.Label(content, text=detail, font=f(Theme.F_BODY_SM),
                  bg=Theme.BG_SECONDARY, fg=Theme.TEXT_MUTED,
-                 anchor="w", justify="left", wraplength=420).pack(
+                 anchor="w", justify="left", wraplength=_scaled(parent, 420)).pack(
                      anchor="w", pady=(8, 0))
 
     # Action row
@@ -2145,7 +2156,12 @@ class _Segment(tk.Canvas):
 
     def __init__(self, parent, label: str, value: str, on_select: Callable,
                  selected: bool = False):
-        super().__init__(parent, height=self.H, highlightthickness=0,
+        root = parent.winfo_toplevel()
+        self.scaled_h = _scaled(root, self.H)
+        # width=1 lets pack(fill="x", expand=True) divide the row evenly across
+        # every segment. Without it, tk.Canvas's default ~378px reqwidth makes
+        # the first segment hog the row and squeezes the rest to 0-4px.
+        super().__init__(parent, width=1, height=self.scaled_h, highlightthickness=0,
                          bg=Theme.BG_TERTIARY, takefocus=1)
         self.label = label
         self.value = value
@@ -2161,7 +2177,7 @@ class _Segment(tk.Canvas):
         self.bind("<Leave>", self._on_leave)
         self.bind("<FocusIn>", lambda e: self._set_focused(True))
         self.bind("<FocusOut>", lambda e: self._set_focused(False))
-        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Configure>", self._draw)
         self._draw()
 
     def _on_enter(self, event):
@@ -2186,12 +2202,18 @@ class _Segment(tk.Canvas):
         self.selected = selected
         self._draw()
 
-    def _draw(self):
+    def _draw(self, event=None):
         self.delete("all")
-        w = max(1, int(self["width"]) if int(self["width"]) > 1 else self.winfo_width())
-        if w <= 1:
+        # Prefer event width (from <Configure>), then winfo_width, then reqwidth
+        if event and hasattr(event, 'width') and event.width > 1:
+            w = event.width
+        else:
             w = self.winfo_width()
-        h = self.H
+        if w <= 1:
+            # Widget not yet mapped; schedule a deferred redraw
+            self.after(50, self._draw)
+            return
+        h = self.scaled_h
         if self.selected:
             bg = Theme.GREEN_MUTED
             fg = Theme.GREEN_PRIMARY
@@ -2218,6 +2240,8 @@ class DragDropFrame(tk.Frame):
 
     def __init__(self, parent, on_drop: Callable[[List[str]], None],
                  width=400, height=200, **kwargs):
+        root = parent.winfo_toplevel()
+        scaled_height = _scaled(root, height)
         super().__init__(parent, bg=Theme.BG_CARD, highlightthickness=1,
                         highlightbackground=Theme.BORDER, highlightcolor=Theme.BLUE_PRIMARY,
                         takefocus=1)
@@ -2227,7 +2251,7 @@ class DragDropFrame(tk.Frame):
         self.hover_bg = Theme.BG_CARD_HOVER
         self.hovered = False
         self.focused = False
-        self.configure(height=height)
+        self.configure(height=scaled_height)
         self.pack_propagate(False)
         self.grid_propagate(False)
         self.config(cursor="hand2")
@@ -2252,7 +2276,7 @@ class DragDropFrame(tk.Frame):
         sub_text = tk.Label(inner,
                            text="Drag files here, choose files, or choose a folder. Originals stay untouched.",
                            font=f(Theme.F_BODY_SM), bg=self.normal_bg,
-                           fg=Theme.TEXT_SECONDARY, justify="center", wraplength=480)
+                           fg=Theme.TEXT_SECONDARY, justify="center", wraplength=_scaled(self.winfo_toplevel(), 480))
         sub_text.pack(pady=(6, 12))
 
         actions = tk.Frame(inner, bg=self.normal_bg)
@@ -3093,7 +3117,7 @@ class VideoSubtitleRemoverApp:
                      pady=(2 if eyebrow else pad_top, 0))
         if hint:
             tk.Label(parent, text=hint, font=f(Theme.F_BODY_SM),
-                     bg=bg, fg=Theme.TEXT_MUTED, wraplength=560,
+                     bg=bg, fg=Theme.TEXT_MUTED, wraplength=_scaled(parent.winfo_toplevel(), 560),
                      justify="left").pack(anchor="w", padx=pad_x, pady=(4, Theme.S_MD))
 
     def _create_card(self, parent, bg=Theme.BG_CARD) -> tk.Frame:
@@ -3344,12 +3368,14 @@ class VideoSubtitleRemoverApp:
 
         mode = "stacked" if width < 1180 else "wide"
         if mode == self._layout_mode:
+            if hasattr(self, "preview_title_label"):
+                self.preview_title_label.config(wraplength=_scaled(self.root, 520 if mode == "stacked" else 360))
             if hasattr(self, "preview_meta_label"):
-                self.preview_meta_label.config(wraplength=520 if mode == "stacked" else 360)
+                self.preview_meta_label.config(wraplength=_scaled(self.root, 520 if mode == "stacked" else 360))
             if hasattr(self, "header_guidance_body"):
-                self.header_guidance_body.config(wraplength=520 if mode == "stacked" else 300)
+                self.header_guidance_body.config(wraplength=_scaled(self.root, 520 if mode == "stacked" else 300))
             if hasattr(self, "status_hint"):
-                self.status_hint.config(wraplength=520 if mode == "stacked" else 360)
+                self.status_hint.config(wraplength=_scaled(self.root, 520 if mode == "stacked" else 360))
             return
 
         self._layout_mode = mode
@@ -3401,9 +3427,11 @@ class VideoSubtitleRemoverApp:
             self.status_hint.pack_forget()
             self.status_hint.pack(side="right")
 
-        self.preview_meta_label.config(wraplength=520 if stacked else 360)
-        self.header_guidance_body.config(wraplength=520 if stacked else 300)
-        self.status_hint.config(wraplength=520 if stacked else 360)
+        if hasattr(self, "preview_title_label"):
+            self.preview_title_label.config(wraplength=_scaled(self.root, 520 if stacked else 360))
+        self.preview_meta_label.config(wraplength=_scaled(self.root, 520 if stacked else 360))
+        self.header_guidance_body.config(wraplength=_scaled(self.root, 520 if stacked else 300))
+        self.status_hint.config(wraplength=_scaled(self.root, 520 if stacked else 360))
 
     def _get_selected_queue_item(self) -> Optional[QueueItem]:
         """Return the currently selected queue item, if any."""
@@ -3536,14 +3564,41 @@ class VideoSubtitleRemoverApp:
         content.columnconfigure(1, weight=43, minsize=360)
         content.rowconfigure(0, weight=1)
 
-        # Left column - Input & Settings
-        left_col = tk.Frame(content, bg=Theme.BG_DARK)
-        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, Theme.S_MD))
+        # Left column - Input & Settings (Scrollable Container)
+        left_col_container = tk.Frame(content, bg=Theme.BG_DARK)
+        left_col_container.grid(row=0, column=0, sticky="nsew", padx=(0, Theme.S_MD))
         self._content = content
-        self._left_col = left_col
+        self._left_col = left_col_container
+
+        self.left_canvas = tk.Canvas(left_col_container, bg=Theme.BG_DARK, highlightthickness=0)
+        left_scrollbar = ttk.Scrollbar(left_col_container, orient="vertical",
+                                       command=self.left_canvas.yview,
+                                       style="Dark.Vertical.TScrollbar")
+        self.left_canvas.configure(yscrollcommand=left_scrollbar.set)
+
+        left_col = tk.Frame(self.left_canvas, bg=Theme.BG_DARK)
+        self._left_scroll_frame = left_col
+
+        left_scrollbar.pack(side="right", fill="y")
+        self.left_canvas.pack(side="left", fill="both", expand=True)
+
+        left_window_id = self.left_canvas.create_window((0, 0), window=left_col, anchor="nw")
+
+        def _on_left_frame_configure(event):
+            self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
+
+        def _on_left_canvas_configure(event):
+            self.left_canvas.itemconfig(left_window_id, width=event.width)
+
+        left_col.bind("<Configure>", _on_left_frame_configure)
+        self.left_canvas.bind("<Configure>", _on_left_canvas_configure)
 
         self._build_input_section(left_col)
         self._build_settings_section(left_col)
+
+        self._bind_left_mousewheel()
+        self.left_canvas.bind("<Enter>", lambda e: self.left_canvas.bind("<MouseWheel>", self._on_left_mousewheel))
+        self.left_canvas.bind("<Leave>", lambda e: self.left_canvas.unbind("<MouseWheel>"))
 
         # Right column - Queue & Preview
         right_col = tk.Frame(content, bg=Theme.BG_DARK)
@@ -3647,7 +3702,7 @@ class VideoSubtitleRemoverApp:
             self._header_guidance_panel,
             text="Import files or choose a folder to start.",
             font=f(Theme.F_BODY_SM),
-            wraplength=300,
+            wraplength=_scaled(self.root, 300),
             justify="left",
             bg=Theme.BG_SECONDARY,
             fg=Theme.TEXT_MUTED,
@@ -3676,7 +3731,7 @@ class VideoSubtitleRemoverApp:
         out_row.pack(fill="x", padx=Theme.S_LG, pady=Theme.S_MD)
 
         label_col = tk.Frame(out_row, bg=Theme.BG_CARD)
-        label_col.pack(side="left", fill="x", expand=True)
+        label_col.pack(fill="x")
 
         tk.Label(label_col, text="OUTPUT LOCATION", font=f(Theme.F_EYEBROW, "bold"),
                  bg=Theme.BG_CARD, fg=Theme.TEXT_MUTED).pack(anchor="w")
@@ -3690,7 +3745,7 @@ class VideoSubtitleRemoverApp:
         self.output_dir_meta.pack(anchor="w", pady=(2, 0))
 
         actions = tk.Frame(out_row, bg=Theme.BG_CARD)
-        actions.pack(side="right", padx=(Theme.S_MD, 0))
+        actions.pack(fill="x", pady=(Theme.S_SM, 0))
 
         choose_btn = ModernButton(actions, text="Choose folder", width=120,
                                   command=self._choose_output_dir, style="accent",
@@ -3779,7 +3834,7 @@ class VideoSubtitleRemoverApp:
         self.algo_desc = tk.Label(profile_panel, text=self._get_algo_description(),
                                   font=f(Theme.F_BODY_SM), bg=Theme.BG_CARD,
                                   fg=Theme.TEXT_SECONDARY, justify="left", anchor="w",
-                                  wraplength=520)
+                                  wraplength=_scaled(self.root, 520))
         self.algo_desc.pack(fill="x", padx=Theme.S_LG, pady=(2, Theme.S_MD))
 
         if self.gpus:
@@ -3868,18 +3923,18 @@ class VideoSubtitleRemoverApp:
                 font=f(Theme.F_META),
                 bg=Theme.BG_CARD,
                 fg=Theme.WARNING,
-                wraplength=520,
+                wraplength=_scaled(self.root, 520),
                 justify="left",
             ).pack(anchor="w", pady=(Theme.S_XS, 0))
 
-        # Region surface -- raised card-within-card
+        # Region surface -- raised card-within-card (vertical stack to avoid clipping)
         region_surface = tk.Frame(workflow_panel, bg=Theme.BG_TERTIARY,
                                   highlightthickness=1,
                                   highlightbackground=Theme.BORDER_SUBTLE)
         region_surface.pack(fill="x", padx=Theme.S_LG, pady=(Theme.S_XS, Theme.S_LG))
 
         region_text = tk.Frame(region_surface, bg=Theme.BG_TERTIARY)
-        region_text.pack(side="left", fill="x", expand=True, padx=Theme.S_MD, pady=Theme.S_MD)
+        region_text.pack(fill="x", padx=Theme.S_MD, pady=(Theme.S_MD, 0))
 
         tk.Label(region_text, text="SUBTITLE REGION", font=f(Theme.F_EYEBROW, "bold"),
                  bg=Theme.BG_TERTIARY, fg=Theme.TEXT_MUTED).pack(anchor="w")
@@ -3895,7 +3950,7 @@ class VideoSubtitleRemoverApp:
         self.region_meta.pack(anchor="w", pady=(2, 0))
 
         region_actions = tk.Frame(region_surface, bg=Theme.BG_TERTIARY)
-        region_actions.pack(side="right", padx=Theme.S_MD, pady=Theme.S_MD)
+        region_actions.pack(fill="x", padx=Theme.S_MD, pady=(Theme.S_SM, Theme.S_MD))
 
         self.region_btn = ModernButton(region_actions, text="Set region", width=100,
                                        command=self._open_region_selector, style="accent",
@@ -4167,10 +4222,23 @@ class VideoSubtitleRemoverApp:
             self.adv_toggle.icon = "-"
             self.adv_toggle.set_text("Hide detailed controls")
             self.adv_panel.pack(fill="x")
+            self._bind_left_mousewheel()  # Re-bind for new advanced controls
         else:
             self.adv_toggle.icon = "+"
             self.adv_toggle.set_text("Show detailed controls")
             self.adv_panel.pack_forget()
+
+    def _on_left_mousewheel(self, event):
+        self.left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _bind_left_mousewheel(self):
+        """Recursively bind mousewheel event to all current widgets in the left column."""
+        def _bind_recursive(widget):
+            widget.bind("<MouseWheel>", self._on_left_mousewheel, add="+")
+            for child in widget.winfo_children():
+                _bind_recursive(child)
+        if hasattr(self, "_left_scroll_frame"):
+            _bind_recursive(self._left_scroll_frame)
 
     def _build_queue_section(self, parent):
         """Queue + preview + batch controls column."""
@@ -4322,12 +4390,14 @@ class VideoSubtitleRemoverApp:
 
         self.preview_title_label = tk.Label(preview_text, text="Preview a sample frame",
                                             font=f(Theme.F_TITLE, "bold"),
-                                            bg=Theme.BG_CARD, fg=Theme.TEXT_PRIMARY)
+                                            bg=Theme.BG_CARD, fg=Theme.TEXT_PRIMARY,
+                                            wraplength=_scaled(preview_text.winfo_toplevel(), 360),
+                                            justify="left")
         self.preview_title_label.pack(anchor="w")
         self.preview_meta_label = tk.Label(
             preview_text,
             text="Select a queued item and review the mask before processing.",
-            font=f(Theme.F_META), wraplength=360,
+            font=f(Theme.F_META), wraplength=_scaled(preview_text.winfo_toplevel(), 360),
             justify="left", bg=Theme.BG_CARD,
             fg=Theme.TEXT_MUTED)
         self.preview_meta_label.pack(anchor="w", pady=(4, 0))
@@ -4428,7 +4498,7 @@ class VideoSubtitleRemoverApp:
                  text="Add files on the left to start a batch.",
                  font=f(Theme.F_BODY_SM),
                  bg=Theme.BG_SECONDARY, fg=Theme.TEXT_MUTED,
-                 wraplength=340, justify="center").pack()
+                 wraplength=_scaled(self.root, 340), justify="center").pack()
 
     def _ensure_filter_empty_state(self):
         """Create the queue filter empty state on demand."""
@@ -4456,7 +4526,7 @@ class VideoSubtitleRemoverApp:
             font=f(Theme.F_BODY_SM),
             bg=Theme.BG_SECONDARY,
             fg=Theme.TEXT_MUTED,
-            wraplength=340,
+            wraplength=_scaled(self.root, 340),
             justify="center",
         )
         self._filter_empty_body.pack()
@@ -4802,7 +4872,7 @@ class VideoSubtitleRemoverApp:
                  text="Use a short name you will recognize later. Saving to an existing user preset name will update it.",
                  font=f(Theme.F_BODY_SM),
                  bg=Theme.BG_SECONDARY, fg=Theme.TEXT_MUTED,
-                 justify="left", wraplength=420).pack(anchor="w", pady=(6, Theme.S_LG))
+                 justify="left", wraplength=_scaled(parent, 420)).pack(anchor="w", pady=(6, Theme.S_LG))
 
         form = tk.Frame(content, bg=Theme.BG_SECONDARY)
         form.pack(fill="x")
@@ -4992,7 +5062,7 @@ class VideoSubtitleRemoverApp:
                          side="left", padx=(Theme.S_SM, 0))
             tk.Label(inner, text=body_text, font=f(Theme.F_BODY_SM),
                      bg=Theme.BG_CARD, fg=Theme.TEXT_SECONDARY,
-                     wraplength=220, justify="left", anchor="w").pack(
+                     wraplength=_scaled(self.root, 220), justify="left", anchor="w").pack(
                          anchor="w", pady=(Theme.S_SM, 0))
             return c
 
@@ -5158,7 +5228,7 @@ class VideoSubtitleRemoverApp:
                         "Completed outputs are ready. Review the outliers or open the log for details.")
         tk.Label(content, text=summary_note, font=f(Theme.F_BODY_SM),
                  bg=Theme.BG_SECONDARY, fg=Theme.TEXT_SECONDARY,
-                 wraplength=420, justify="left").pack(anchor="w", pady=(Theme.S_SM, 0))
+                 wraplength=_scaled(self.root, 420), justify="left").pack(anchor="w", pady=(Theme.S_SM, 0))
 
         # Stat row (compact pills)
         stats = tk.Frame(content, bg=Theme.BG_SECONDARY)
@@ -5219,7 +5289,7 @@ class VideoSubtitleRemoverApp:
                 font=f(Theme.F_META),
                 bg=Theme.BG_CARD,
                 fg=Theme.TEXT_MUTED,
-                wraplength=420,
+                wraplength=_scaled(self.root, 420),
                 justify="left",
             ).pack(anchor="w", padx=Theme.S_LG, pady=(4, Theme.S_MD))
 
