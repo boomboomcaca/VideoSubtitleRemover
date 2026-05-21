@@ -5667,9 +5667,9 @@ class VideoSubtitleRemoverApp:
             if cw <= 1 or ch <= 1:
                 cw, ch = disp_w, disp_h
                 
-            # Calculate dynamic scale to completely fill the canvas area (Aspect Fill)
-            # This fills the screen and naturally crops embedded black bars on cinematic videos
-            new_scale = max(cw / orig_w, ch / orig_h)
+            # Calculate dynamic scale based on the available canvas area (Aspect Fit)
+            # This ensures 100% of the video frame is visible so no watermarks or subtitles are cropped out
+            new_scale = min(cw / orig_w, ch / orig_h)
             new_w, new_h = int(orig_w * new_scale), int(orig_h * new_scale)
             win_state["current_scale"] = new_scale
             
