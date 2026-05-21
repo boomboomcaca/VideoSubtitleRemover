@@ -22,7 +22,8 @@ import logging
 import logging.handlers
 import traceback
 from pathlib import Path
-from typing import Optional, List, Tuple, Callable
+from typing import Optional, List, Tuple, Callable, Dict
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
@@ -2842,6 +2843,10 @@ class VideoSubtitleRemoverApp:
         self._throbber_phase = 0
         self._layout_mode = "wide"
         self._workflow_pills = []
+        self._last_timeline_frames: Dict[str, int] = {}  # remember last timeline frame per queue item id
+
+        # Tidy up stale SAM mask PNGs left over from previous sessions
+        self._cleanup_old_sam_masks()
 
         # Variables
         self.mode_var = tk.StringVar(value=self.config.mode.value)
@@ -5520,6 +5525,26 @@ class VideoSubtitleRemoverApp:
             message += f". Updated {refreshed} idle output path{'s' if refreshed != 1 else ''}"
         self._update_status(message)
 
+    def _cleanup_old_sam_masks(self, max_age_days: int = 30):
+        """Remove stale SAM precise-mask PNG files left over from old sessions."""
+        try:
+            mask_dir = Path(os.environ.get("APPDATA", Path.home())) / "VideoSubtitleRemoverPro"
+            if not mask_dir.exists():
+                return
+            cutoff = time.time() - max_age_days * 86400
+            removed = 0
+            for f in mask_dir.glob("sam_mask_*.png"):
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        removed += 1
+                except Exception:
+                    pass
+            if removed > 0:
+                logger.info(f"Cleaned up {removed} stale SAM mask file(s) older than {max_age_days} days")
+        except Exception as e:
+            logger.warning(f"Failed to clean up old SAM mask files: {e}")
+
     def _open_region_selector(self):
         """Open a window to draw a subtitle region rectangle on the first frame."""
         import numpy as np
@@ -5541,16 +5566,29 @@ class VideoSubtitleRemoverApp:
         if not source_path:
             return
 
-        # Load first frame
+        # Resume from the user's last viewed timeline frame (if any) for this queue item
+        restore_frame_idx = 0
+        if selected:
+            restore_frame_idx = self._last_timeline_frames.get(selected.id, 0)
+
+        # Load the appropriate frame (resume frame for videos, otherwise the image / first frame)
         try:
             import cv2 as _cv2
             if is_video_file(source_path):
                 cap = _cv2.VideoCapture(source_path)
                 try:
+                    if restore_frame_idx > 0:
+                        cap.set(_cv2.CAP_PROP_POS_FRAMES, restore_frame_idx)
                     ret, frame = cap.read()
                     if not ret:
-                        logger.error("Could not read video frame for region selection")
-                        return
+                        # Fallback to first frame if seek failed
+                        if restore_frame_idx > 0:
+                            cap.set(_cv2.CAP_PROP_POS_FRAMES, 0)
+                            ret, frame = cap.read()
+                            restore_frame_idx = 0
+                        if not ret:
+                            logger.error("Could not read video frame for region selection")
+                            return
                 finally:
                     cap.release()
             else:
@@ -5558,6 +5596,7 @@ class VideoSubtitleRemoverApp:
                 if frame is None:
                     logger.error("Could not read image for region selection")
                     return
+                restore_frame_idx = 0
         except Exception as e:
             logger.error(f"Region selector error: {e}")
             return
@@ -5581,10 +5620,14 @@ class VideoSubtitleRemoverApp:
         except Exception as e:
             logger.warning(f"Could not read video metadata for timeline: {e}")
 
-        frame_cache = {0: frame_rgb}
+        # LRU frame cache with adaptive limit (smaller cache for high-resolution videos to avoid RAM bloat)
+        frame_cache: "OrderedDict[int, any]" = OrderedDict()
+        frame_cache[restore_frame_idx] = frame_rgb
+        cache_limit = 5 if (orig_w * orig_h) > 2_500_000 else 10
 
         def get_frame_at_index(idx):
             if idx in frame_cache:
+                frame_cache.move_to_end(idx)
                 return frame_cache[idx]
             try:
                 cap = _cv2.VideoCapture(source_path)
@@ -5593,8 +5636,8 @@ class VideoSubtitleRemoverApp:
                 cap.release()
                 if ret and f is not None:
                     rgb_f = _cv2.cvtColor(f, _cv2.COLOR_BGR2RGB)
-                    if len(frame_cache) > 10:
-                        frame_cache.clear()
+                    while len(frame_cache) >= cache_limit:
+                        frame_cache.popitem(last=False)
                     frame_cache[idx] = rgb_f
                     return rgb_f
             except Exception as e:
@@ -5629,7 +5672,10 @@ class VideoSubtitleRemoverApp:
             "start": [0, 0],
             "current_scale": scale,
             "last_configure_time": 0.0,
-            "current_frame_rgb": frame_rgb
+            "current_frame_rgb": frame_rgb,
+            "sam_embed_timer": None,
+            "canvas_resize_timer": None,
+            "fill_mode": False,
         }
 
         # 1. Background image canvas
@@ -5667,13 +5713,13 @@ class VideoSubtitleRemoverApp:
             if cw <= 1 or ch <= 1:
                 cw, ch = disp_w, disp_h
                 
-            # Calculate dynamic scale based on the available canvas area (Aspect Fit)
-            # This ensures 100% of the video frame is visible so no watermarks or subtitles are cropped out
-            new_scale = min(cw / orig_w, ch / orig_h)
+            # Calculate dynamic scale: Aspect Fit (default) keeps 100% visible; Aspect Fill crops black bars
+            if win_state.get("fill_mode"):
+                new_scale = max(cw / orig_w, ch / orig_h)
+            else:
+                new_scale = min(cw / orig_w, ch / orig_h)
             new_w, new_h = int(orig_w * new_scale), int(orig_h * new_scale)
             win_state["current_scale"] = new_scale
-            
-            logger.info(f"[DEBUG REDRAW] cw={cw}, ch={ch}, orig_w={orig_w}, orig_h={orig_h}, new_scale={new_scale:.4f}, new_w={new_w}, new_h={new_h}")
             
             base_img = Image.fromarray(win_state["current_frame_rgb"])
             if win_state["current_mask"] is not None:
@@ -5703,7 +5749,15 @@ class VideoSubtitleRemoverApp:
             if event.width > 1 and event.height > 1:
                 import time as _time
                 win_state["last_configure_time"] = _time.time()
-                redraw_image(event.width, event.height)
+                # Debounce rapid configure events (e.g. when dragging the window border) to avoid CPU/memory spikes
+                if win_state.get("canvas_resize_timer"):
+                    try:
+                        win.after_cancel(win_state["canvas_resize_timer"])
+                    except Exception:
+                        pass
+                cw_capt, ch_capt = event.width, event.height
+                win_state["canvas_resize_timer"] = win.after(
+                    80, lambda: redraw_image(cw_capt, ch_capt))
                 
         canvas.bind("<Configure>", on_canvas_configure)
 
@@ -5747,13 +5801,11 @@ class VideoSubtitleRemoverApp:
                 return f"{mins:02d}:{secs:02d}.{ms:d}"
 
             total_time_str = format_time(total_frames - 1, fps)
-            time_lbl = tk.Label(timeline_frame, 
-                                text=f"00:00.0 / {total_time_str} (Frame 0/{total_frames-1})",
+            initial_time_str = format_time(restore_frame_idx, fps)
+            time_lbl = tk.Label(timeline_frame,
+                                text=f"{initial_time_str} / {total_time_str} (Frame {restore_frame_idx}/{total_frames-1})",
                                 font=f(Theme.F_META), bg=Theme.BG_OVERLAY, fg=Theme.TEXT_SECONDARY)
             time_lbl.pack(side="left", padx=(0, Theme.S_MD))
-
-            # Reference to store the active Tkinter timer for SAM embedding debouncing
-            self._sam_embed_timer = None
 
             def on_timeline_scroll(val_str):
                 idx = int(float(val_str))
@@ -5763,15 +5815,22 @@ class VideoSubtitleRemoverApp:
                     redraw_image()
                     cur_time_str = format_time(idx, fps)
                     time_lbl.config(text=f"{cur_time_str} / {total_time_str} (Frame {idx}/{total_frames-1})")
+
+                    # Remember the last viewed frame per queue item, so reopening Set region returns to it
+                    if selected:
+                        self._last_timeline_frames[selected.id] = idx
                     
                     # Debounce the heavy CUDA SAM embedding calculation to avoid spawning overlapping threads on fast dragging
                     if win_state["sam_ready"] and win_state["segmentor"] is not None:
-                        if self._sam_embed_timer:
-                            win.after_cancel(self._sam_embed_timer)
-                            self._sam_embed_timer = None
+                        if win_state.get("sam_embed_timer"):
+                            try:
+                                win.after_cancel(win_state["sam_embed_timer"])
+                            except Exception:
+                                pass
+                            win_state["sam_embed_timer"] = None
 
                         def trigger_update():
-                            self._sam_embed_timer = None
+                            win_state["sam_embed_timer"] = None
                             if not win.winfo_exists():
                                 return
                             sam_status_label.config(text="✨ SAM: Embedding new frame...", fg=Theme.BLUE_PRIMARY)
@@ -5789,9 +5848,9 @@ class VideoSubtitleRemoverApp:
                                     
                             threading.Thread(target=update_sam_embeddings_thread, daemon=True).start()
 
-                        self._sam_embed_timer = win.after(350, trigger_update)
+                        win_state["sam_embed_timer"] = win.after(350, trigger_update)
 
-            timeline_slider = ModernSlider(timeline_frame, from_=0, to=total_frames - 1, value=0, bg=Theme.BG_OVERLAY)
+            timeline_slider = ModernSlider(timeline_frame, from_=0, to=total_frames - 1, value=restore_frame_idx, bg=Theme.BG_OVERLAY)
             timeline_slider.pack(side="left", fill="x", expand=True)
             timeline_slider.command = on_timeline_scroll
 
@@ -5873,6 +5932,15 @@ class VideoSubtitleRemoverApp:
 
         def cleanup_and_destroy():
             logger.info("Cleaning up SAM resources...")
+            # Cancel any pending debounced timers so they don't fire on a destroyed window
+            for tk_key in ("sam_embed_timer", "canvas_resize_timer"):
+                tid = win_state.get(tk_key)
+                if tid:
+                    try:
+                        win.after_cancel(tid)
+                    except Exception:
+                        pass
+                    win_state[tk_key] = None
             win_state["segmentor"] = None
             # Force cleanup of PyTorch & CUDA VRAM
             import gc
@@ -5887,6 +5955,15 @@ class VideoSubtitleRemoverApp:
 
         cancel_btn = ModernButton(actions_frame, text="Cancel", command=cleanup_and_destroy, width=76, style="secondary", size="sm")
         cancel_btn.pack(side="right", padx=Theme.S_XS)
+
+        # Aspect Fit / Aspect Fill toggle (left side); Fit (default) keeps everything visible, Fill crops black bars
+        def toggle_fill_mode():
+            win_state["fill_mode"] = not win_state.get("fill_mode", False)
+            fit_fill_btn.set_text("Aspect: Fill" if win_state["fill_mode"] else "Aspect: Fit")
+            redraw_image()
+
+        fit_fill_btn = ModernButton(actions_frame, text="Aspect: Fit", command=toggle_fill_mode, width=110, style="ghost", size="sm")
+        fit_fill_btn.pack(side="left")
 
         # Enable/Disable Save Button state
         def update_save_state():
