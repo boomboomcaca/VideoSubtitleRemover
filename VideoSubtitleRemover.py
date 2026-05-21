@@ -3618,34 +3618,38 @@ class VideoSubtitleRemoverApp:
         self._build_footer(main_container)
 
     def _build_header(self, parent):
-        """Minimal app header with short guidance and a few live status signals."""
+        """Ultra-compact app header with horizontal flow to maximize vertical workspace."""
         header = self._create_surface(parent)
         header.pack(fill="x")
 
+        # Dramatically reduce vertical padding from S_LG (16px) to S_XS (4px)
         inner = tk.Frame(header, bg=Theme.BG_SECONDARY)
-        inner.pack(fill="x", padx=Theme.S_XL, pady=Theme.S_LG)
+        inner.pack(fill="x", padx=Theme.S_XL, pady=Theme.S_XS)
 
+        # 👈 Left Side: Title and Version on a single horizontal row
         left = tk.Frame(inner, bg=Theme.BG_SECONDARY)
         left.pack(side="left", fill="both", expand=True)
         self._header_left = left
 
-        tk.Label(left, text="Video Subtitle Remover",
-                 font=f(Theme.F_DISPLAY, "bold"), bg=Theme.BG_SECONDARY,
-                 fg=Theme.TEXT_PRIMARY).pack(anchor="w")
-        tk.Label(left, text=f"Version {APP_VERSION}",
-                 font=f(Theme.F_META, "bold"), bg=Theme.BG_SECONDARY,
-                 fg=Theme.TEXT_MUTED).pack(anchor="w", pady=(2, 0))
-        tk.Label(
-            left,
-            text="Add files, review one sample, then run the batch.",
-            font=f(Theme.F_BODY),
-            bg=Theme.BG_SECONDARY,
-            fg=Theme.TEXT_SECONDARY,
-        ).pack(anchor="w", pady=(8, 0))
+        title_row = tk.Frame(left, bg=Theme.BG_SECONDARY)
+        title_row.pack(anchor="w", fill="x", pady=(2, 0))
 
+        tk.Label(title_row, text="Video Subtitle Remover",
+                 font=f(Theme.F_TITLE, "bold"), bg=Theme.BG_SECONDARY,
+                 fg=Theme.TEXT_PRIMARY).pack(side="left")
+
+        tk.Label(title_row, text=f"v{APP_VERSION}",
+                 font=f(Theme.F_META, "bold"), bg=Theme.BG_SECONDARY,
+                 fg=Theme.TEXT_MUTED).pack(side="left", padx=(Theme.S_SM, 0), pady=(2, 0))
+
+        # 👉 Right Side: Status Chips, Help Button, and Progress Pills packed compactly
         right = tk.Frame(inner, bg=Theme.BG_SECONDARY)
-        right.pack(side="right", anchor="n")
+        right.pack(side="right", anchor="e")
         self._header_right = right
+
+        # Row 1 of Right: Chips and Help Button next to each other
+        right_row = tk.Frame(right, bg=Theme.BG_SECONDARY)
+        right_row.pack(anchor="e")
 
         gpu_short = truncate_middle(self.gpus[0]["name"], 26) if self.gpus else "CPU mode"
         gpu_fg = Theme.SUCCESS if self.gpus else Theme.WARNING
@@ -3653,8 +3657,8 @@ class VideoSubtitleRemoverApp:
         audio_short = "FFmpeg ready" if self.ffmpeg_ready else "No FFmpeg"
         audio_fg = Theme.SUCCESS if self.ffmpeg_ready else Theme.WARNING
 
-        chips = tk.Frame(right, bg=Theme.BG_SECONDARY)
-        chips.pack(anchor="e")
+        chips = tk.Frame(right_row, bg=Theme.BG_SECONDARY)
+        chips.pack(side="left")
         self._header_chips = chips
 
         self._create_chip(chips, "Device", gpu_short, gpu_fg, Theme.BG_CARD).pack(side="left")
@@ -3663,55 +3667,54 @@ class VideoSubtitleRemoverApp:
         self._create_chip(chips, "Audio", audio_short, audio_fg, Theme.BG_CARD).pack(
             side="left", padx=(Theme.S_SM, 0))
 
-        # About / help
-        help_btn = ModernButton(right, text="Help", width=80,
+        # About / help button placed on the same line next to chips
+        help_btn = ModernButton(right_row, text="Help", width=70,
                                 command=self._show_about, style="ghost",
                                 size="sm", icon="?")
-        help_btn.pack(anchor="e", pady=(Theme.S_SM, 0))
+        help_btn.pack(side="left", padx=(Theme.S_MD, 0))
         self._header_help_btn = help_btn
 
+        # Row 2 of Right: Compact workflow step pills and single compact guidance text
         self._header_guidance_panel = tk.Frame(right, bg=Theme.BG_SECONDARY)
-        self._header_guidance_panel.pack(anchor="e", fill="x", pady=(Theme.S_SM, 0))
+        self._header_guidance_panel.pack(anchor="e", fill="x", pady=(Theme.S_XS, 0))
 
-        # Workflow step pills (Import → Inspect → Run)
         pills_row = tk.Frame(self._header_guidance_panel, bg=Theme.BG_SECONDARY)
-        pills_row.pack(anchor="w", pady=(0, Theme.S_SM))
+        pills_row.pack(side="left", anchor="w")
         for idx, step_label in enumerate(("Import", "Inspect", "Run"), start=1):
             pill_frame = tk.Frame(pills_row, bg=Theme.BG_CARD,
                                   highlightthickness=1, highlightbackground=Theme.BORDER)
             badge_lbl = tk.Label(pill_frame, text=str(idx),
                                  font=f(Theme.F_META, "bold"),
                                  bg=Theme.BG_TERTIARY, fg=Theme.TEXT_MUTED,
-                                 padx=5, pady=2)
-            badge_lbl.pack(side="left", padx=(5, 0), pady=4)
+                                 padx=4, pady=1) # tighter padding
+            badge_lbl.pack(side="left", padx=(4, 0), pady=2)
             text_lbl = tk.Label(pill_frame, text=step_label,
                                 font=f(Theme.F_BODY_SM),
                                 bg=Theme.BG_CARD, fg=Theme.TEXT_SECONDARY)
-            text_lbl.pack(side="left", padx=(Theme.S_XS, 8), pady=4)
+            text_lbl.pack(side="left", padx=(Theme.S_XS, 6), pady=2)
             pill_frame.pack(side="left",
                             padx=(0 if idx == 1 else Theme.S_XS, 0))
             self._workflow_pills.append({
                 "frame": pill_frame, "badge": badge_lbl, "text": text_lbl,
             })
 
-        self.header_guidance_title = tk.Label(
-            self._header_guidance_panel,
-            text="Build your batch",
-            font=f(Theme.F_TITLE, "bold"),
-            bg=Theme.BG_SECONDARY,
-            fg=Theme.TEXT_PRIMARY,
-        )
-        self.header_guidance_title.pack(anchor="w")
+        # Compact combined guidance title and description label to fit beside the pills
+        # Keep title object alive for compatibility but un-packed to save space
+        self.header_guidance_title = tk.Label(self._header_guidance_panel, text="Build your batch",
+                                             font=f(Theme.F_BODY_SM, "bold"), bg=Theme.BG_SECONDARY,
+                                             fg=Theme.TEXT_PRIMARY)
+        self.header_guidance_title.pack_forget()
+
         self.header_guidance_body = tk.Label(
             self._header_guidance_panel,
             text="Import files or choose a folder to start.",
-            font=f(Theme.F_BODY_SM),
+            font=f(Theme.F_META),
             wraplength=_scaled(self.root, 300),
-            justify="left",
+            justify="right",
             bg=Theme.BG_SECONDARY,
             fg=Theme.TEXT_MUTED,
         )
-        self.header_guidance_body.pack(anchor="w", fill="x", pady=(4, 0))
+        self.header_guidance_body.pack(side="right", anchor="e", padx=(Theme.S_MD, 0))
 
     def _build_input_section(self, parent):
         """Workspace section: drop zone + output location."""
@@ -3838,8 +3841,14 @@ class VideoSubtitleRemoverApp:
         self.algo_desc = tk.Label(profile_panel, text=self._get_algo_description(),
                                   font=f(Theme.F_BODY_SM), bg=Theme.BG_CARD,
                                   fg=Theme.TEXT_SECONDARY, justify="left", anchor="w",
-                                  wraplength=_scaled(self.root, 520))
+                                  wraplength=_scaled(self.root, 320))
         self.algo_desc.pack(fill="x", padx=Theme.S_LG, pady=(2, Theme.S_MD))
+
+        # Dynamically auto-wrap text based on actual width of the label to prevent clipping
+        def _on_algo_desc_configure(event):
+            if event.width > 30:
+                self.algo_desc.config(wraplength=event.width - 10)
+        self.algo_desc.bind("<Configure>", _on_algo_desc_configure)
 
         if self.gpus:
             row2 = tk.Frame(profile_panel, bg=Theme.BG_CARD)
@@ -5547,6 +5556,38 @@ class VideoSubtitleRemoverApp:
         frame_rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
         orig_h, orig_w = frame_rgb.shape[:2]
 
+        # Extract video total frame count and FPS for interactive scrubbing timeline
+        total_frames = 1
+        fps = 30.0
+        try:
+            if is_video_file(source_path):
+                cap = _cv2.VideoCapture(source_path)
+                total_frames = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+                fps = cap.get(_cv2.CAP_PROP_FPS) or 30.0
+                cap.release()
+        except Exception as e:
+            logger.warning(f"Could not read video metadata for timeline: {e}")
+
+        frame_cache = {0: frame_rgb}
+
+        def get_frame_at_index(idx):
+            if idx in frame_cache:
+                return frame_cache[idx]
+            try:
+                cap = _cv2.VideoCapture(source_path)
+                cap.set(_cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, f = cap.read()
+                cap.release()
+                if ret and f is not None:
+                    rgb_f = _cv2.cvtColor(f, _cv2.COLOR_BGR2RGB)
+                    if len(frame_cache) > 10:
+                        frame_cache.clear()
+                    frame_cache[idx] = rgb_f
+                    return rgb_f
+            except Exception as e:
+                logger.error(f"Error fetching frame at index {idx}: {e}")
+            return None
+
         # Scale to fit screen (80% of screen size max)
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
@@ -5572,7 +5613,9 @@ class VideoSubtitleRemoverApp:
             "sam_ready": False,
             "rect_id": None,
             "start": [0, 0],
-            "current_scale": scale
+            "current_scale": scale,
+            "last_configure_time": 0.0,
+            "current_frame_rgb": frame_rgb
         }
 
         # 1. Background image canvas
@@ -5615,7 +5658,7 @@ class VideoSubtitleRemoverApp:
             new_w, new_h = int(orig_w * new_scale), int(orig_h * new_scale)
             win_state["current_scale"] = new_scale
             
-            base_img = Image.fromarray(frame_rgb)
+            base_img = Image.fromarray(win_state["current_frame_rgb"])
             if win_state["current_mask"] is not None:
                 img_rgba = base_img.convert("RGBA")
                 mask_colored = np.zeros((*win_state["current_mask"].shape, 4), dtype=np.uint8)
@@ -5641,6 +5684,8 @@ class VideoSubtitleRemoverApp:
 
         def on_canvas_configure(event):
             if event.width > 1 and event.height > 1:
+                import time as _time
+                win_state["last_configure_time"] = _time.time()
                 redraw_image(event.width, event.height)
                 
         canvas.bind("<Configure>", on_canvas_configure)
@@ -5648,18 +5693,22 @@ class VideoSubtitleRemoverApp:
         # 2. Control & Mode Toggle Panel (Premium Card look)
         control_frame = tk.Frame(win, bg=Theme.BG_CARD, highlightthickness=1, highlightbackground=Theme.BORDER_SUBTLE)
 
-        # 3. Status and Instruction Labels
-        instruction_label = tk.Label(control_frame, 
+        # Center-wrapped container inside control_frame to hold both labels on a single line
+        text_wrapper = tk.Frame(control_frame, bg=Theme.BG_CARD)
+        text_wrapper.pack(anchor="center", pady=Theme.S_SM)
+
+        # 3. Status and Instruction Labels side-by-side
+        instruction_label = tk.Label(text_wrapper, 
                                      text="Initializing Smart Click mode...", 
                                      font=f(Theme.F_BODY_SM, "bold"),
                                      bg=Theme.BG_CARD, fg=Theme.TEXT_SECONDARY)
-        instruction_label.pack(side="left", padx=Theme.S_MD, pady=Theme.S_SM)
+        instruction_label.pack(side="left")
 
-        sam_status_label = tk.Label(control_frame, 
+        sam_status_label = tk.Label(text_wrapper, 
                                     text="✨ SAM: Loading model...", 
                                     font=f(Theme.F_META),
                                     bg=Theme.BG_CARD, fg=Theme.BLUE_PRIMARY)
-        sam_status_label.pack(side="right", padx=Theme.S_MD, pady=Theme.S_SM)
+        sam_status_label.pack(side="left", padx=(Theme.S_MD, 0))
 
         # 4. Lower Actions Row (Save, Cancel, Mode switches)
         actions_frame = tk.Frame(win, bg=Theme.BG_OVERLAY)
@@ -5667,6 +5716,52 @@ class VideoSubtitleRemoverApp:
         # Dock-packing from the bottom up to maintain consistent anchoring
         actions_frame.pack(side="bottom", fill="x", padx=Theme.S_MD, pady=Theme.S_MD)
         control_frame.pack(side="bottom", fill="x", padx=Theme.S_MD, pady=(Theme.S_SM, 0))
+
+        # 3.5. Sleek Timeline Panel (Only for multi-frame videos)
+        if total_frames > 1:
+            timeline_frame = tk.Frame(win, bg=Theme.BG_OVERLAY)
+            timeline_frame.pack(side="bottom", fill="x", padx=Theme.S_MD, pady=(Theme.S_SM, 0))
+
+            def format_time(f_idx, fps_val):
+                seconds = f_idx / fps_val
+                mins = int(seconds // 60)
+                secs = int(seconds % 60)
+                ms = int((seconds - int(seconds)) * 10)
+                return f"{mins:02d}:{secs:02d}.{ms:d}"
+
+            total_time_str = format_time(total_frames - 1, fps)
+            time_lbl = tk.Label(timeline_frame, 
+                                text=f"00:00.0 / {total_time_str} (Frame 0/{total_frames-1})",
+                                font=f(Theme.F_META), bg=Theme.BG_OVERLAY, fg=Theme.TEXT_SECONDARY)
+            time_lbl.pack(side="left", padx=(0, Theme.S_MD))
+
+            def on_timeline_scroll(val_str):
+                idx = int(float(val_str))
+                new_f = get_frame_at_index(idx)
+                if new_f is not None:
+                    win_state["current_frame_rgb"] = new_f
+                    redraw_image()
+                    cur_time_str = format_time(idx, fps)
+                    time_lbl.config(text=f"{cur_time_str} / {total_time_str} (Frame {idx}/{total_frames-1})")
+                    
+                    if win_state["sam_ready"] and win_state["segmentor"] is not None:
+                        sam_status_label.config(text="✨ SAM: Embedding new frame...", fg=Theme.BLUE_PRIMARY)
+                        
+                        def update_sam_embeddings():
+                            try:
+                                if win_state["segmentor"] is not None:
+                                    win_state["segmentor"].set_image(new_f)
+                                    if win.winfo_exists():
+                                        win.after(0, lambda: sam_status_label.config(text="✨ SAM: Ready", fg=Theme.SUCCESS))
+                            except Exception as ex:
+                                logger.error(f"Failed to update SAM embeddings: {ex}")
+                                
+                        threading.Thread(target=update_sam_embeddings, daemon=True).start()
+
+            timeline_slider = ModernSlider(timeline_frame, from_=0, to=total_frames - 1, value=0, bg=Theme.BG_OVERLAY)
+            timeline_slider.pack(side="left", fill="x", expand=True)
+            timeline_slider.command = on_timeline_scroll
+
         canvas.pack(side="top", fill="both", expand=True)
 
         def switch_mode(new_mode):
@@ -5764,7 +5859,7 @@ class VideoSubtitleRemoverApp:
                 from backend.sam_segmentor import SAMSegmentor
                 
                 segmentor = SAMSegmentor(device=device)
-                segmentor.set_image(frame_rgb)
+                segmentor.set_image(win_state["current_frame_rgb"])
                 
                 if win.winfo_exists():
                     win_state["segmentor"] = segmentor
@@ -5790,6 +5885,11 @@ class VideoSubtitleRemoverApp:
 
         # 6. Mouse Event Handlers
         def on_press(event):
+            import time as _time
+            # Ignore clicks that happen within 350ms of a window resize/configure event (e.g. title bar double-click restoration)
+            if _time.time() - win_state.get("last_configure_time", 0.0) < 0.35:
+                return
+
             win_state["start"][0], win_state["start"][1] = event.x, event.y
             
             if win_state["mode"] == "box":
@@ -5863,12 +5963,13 @@ class VideoSubtitleRemoverApp:
         switch_mode("sam")
 
         # Mathematically calculate the perfect initial window size to match the video frame and controls
-        init_w = disp_w
-        init_h = disp_h + _scaled(self.root, 110)
+        init_w = max(disp_w, _scaled(self.root, 580))
+        extra_h = 170 if total_frames > 1 else 125
+        init_h = disp_h + _scaled(self.root, extra_h)
         win.geometry(f"{init_w}x{init_h}")
         win.minsize(init_w, init_h)
 
-        win.transient(self.root)
+        # Disable transient to restore native Windows Maximize/Minimize buttons and title bar double-click behavior
         win.grab_set()
 
     def _reset_region(self):
