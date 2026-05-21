@@ -147,6 +147,7 @@ class ProcessingConfig:
     # Multi-region masks: list of (x1,y1,x2,y2) rects. When set, subtitle_area
     # is ignored and every rect is added to the composite mask.
     subtitle_areas: Optional[List[Tuple[int, int, int, int]]] = None
+    sam_mask_path: Optional[str] = None
 
     # Optional debug artifacts
     export_mask_video: bool = False   # write a B/W mp4 of the per-frame masks
@@ -389,6 +390,7 @@ def normalize_processing_config(config: ProcessingConfig) -> ProcessingConfig:
     config.lama_frame_cache_size = _coerce_int(config.lama_frame_cache_size, 16, 1, 256)
     config.subtitle_area = _coerce_rect(config.subtitle_area)
     config.subtitle_areas = _coerce_rect_list(config.subtitle_areas)
+    config.sam_mask_path = _coerce_text(getattr(config, "sam_mask_path", None), None, 1024)
     config.detection_threshold = _coerce_float(config.detection_threshold, 0.5, 0.1, 1.0)
     config.detection_lang = _coerce_text(config.detection_lang, "en", 24).lower()
     config.detection_frame_skip = _coerce_int(config.detection_frame_skip, 0, 0, 240)
@@ -2273,6 +2275,25 @@ class SubtitleRemover:
     def _create_mask(self, frame_shape: Tuple[int, int], boxes: List[Tuple[int, int, int, int]],
                      padding: int = 5) -> np.ndarray:
         h, w = frame_shape[:2]
+
+        # Use precise SAM mask if available
+        sam_mask_path = getattr(self.config, "sam_mask_path", None)
+        if sam_mask_path and os.path.exists(sam_mask_path):
+            try:
+                sam_mask = cv2.imread(sam_mask_path, cv2.IMREAD_GRAYSCALE)
+                if sam_mask is not None:
+                    if sam_mask.shape[:2] != (h, w):
+                        sam_mask = cv2.resize(sam_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                    
+                    dilate_px = self.config.mask_dilate_px
+                    if dilate_px > 0 and sam_mask.max() > 0:
+                        kernel = cv2.getStructuringElement(
+                            cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+                        sam_mask = cv2.dilate(sam_mask, kernel, iterations=1)
+                    return sam_mask
+            except Exception as e:
+                logger.warning(f"Failed to load custom SAM mask from {sam_mask_path}: {e}")
+
         mask = np.zeros((h, w), dtype=np.uint8)
         for x1, y1, x2, y2 in boxes:
             x1 = max(0, x1 - padding)

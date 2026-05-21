@@ -300,6 +300,7 @@ class ProcessingConfig:
 
     # v3.9 workflow features
     subtitle_areas: Optional[List[Tuple[int, int, int, int]]] = None  # multi-region
+    sam_mask_path: Optional[str] = None
     auto_band: bool = False             # auto-detect dominant subtitle band on load
     export_srt: bool = False            # write detected text as SRT sidecar
     export_mask_video: bool = False     # write B/W mask debug mp4
@@ -362,6 +363,7 @@ class ProcessingConfig:
             "tbe_scene_cut_threshold": self.tbe_scene_cut_threshold,
             "edge_ring_px": self.edge_ring_px,
             "subtitle_areas": [list(r) for r in self.subtitle_areas] if self.subtitle_areas else None,
+            "sam_mask_path": self.sam_mask_path,
             "auto_band": self.auto_band,
             "export_srt": self.export_srt,
             "export_mask_video": self.export_mask_video,
@@ -414,6 +416,7 @@ class ProcessingConfig:
         self.tbe_scene_cut_split = _coerce_bool(self.tbe_scene_cut_split, True)
         self.tbe_scene_cut_threshold = _coerce_float(self.tbe_scene_cut_threshold, 0.35, 0.0, 1.0)
         self.edge_ring_px = _coerce_int(self.edge_ring_px, 2, 0, 8)
+        self.sam_mask_path = _coerce_text(getattr(self, "sam_mask_path", None), None, 1024)
         self.auto_band = _coerce_bool(self.auto_band, False)
         self.export_srt = _coerce_bool(self.export_srt, False)
         self.export_mask_video = _coerce_bool(self.export_mask_video, False)
@@ -471,6 +474,7 @@ class ProcessingConfig:
             tbe_scene_cut_threshold=data.get("tbe_scene_cut_threshold", 0.35),
             edge_ring_px=data.get("edge_ring_px", 2),
             subtitle_areas=_coerce_rect_list(data.get("subtitle_areas")),
+            sam_mask_path=data.get("sam_mask_path", None),
             auto_band=data.get("auto_band", False),
             export_srt=data.get("export_srt", False),
             export_mask_video=data.get("export_mask_video", False),
@@ -5496,6 +5500,7 @@ class VideoSubtitleRemoverApp:
 
     def _open_region_selector(self):
         """Open a window to draw a subtitle region rectangle on the first frame."""
+        import numpy as np
         # Use the selected queue item first, then fall back to the first queued file.
         source_path = None
         selected = self._get_selected_queue_item()
@@ -5547,72 +5552,321 @@ class VideoSubtitleRemoverApp:
         screen_h = self.root.winfo_screenheight()
         max_w = min(800, int(screen_w * 0.8))
         max_h = min(500, int(screen_h * 0.7))
-        scale = min(max_w / orig_w, max_h / orig_h, 1.0)
+        scale = min(max_w / orig_w, max_h / orig_h)
         disp_w, disp_h = int(orig_w * scale), int(orig_h * scale)
 
         img = Image.fromarray(frame_rgb).resize((disp_w, disp_h), Image.LANCZOS)
 
         # Create Toplevel window
         win = tk.Toplevel(self.root)
-        win.title("Choose subtitle region")
+        win.title("Set Subtitle/Watermark Region")
         win.configure(bg=Theme.BG_OVERLAY)
-        win.resizable(False, False)
-        win.geometry(f"{disp_w}x{disp_h + 64}")
+        win.resizable(True, True)  # Allow resizing to prevent clipping under extreme scaling
 
+        # Local window state
+        win_state = {
+            "mode": "sam", # "sam" or "box"
+            "selected_box": None,
+            "current_mask": None,
+            "segmentor": None,
+            "sam_ready": False,
+            "rect_id": None,
+            "start": [0, 0],
+            "current_scale": scale
+        }
+
+        # 1. Background image canvas
         photo = ImageTk.PhotoImage(img)
         canvas = tk.Canvas(win, width=disp_w, height=disp_h, highlightthickness=0,
                            bg=Theme.BG_DARK, cursor="cross")
-        canvas.pack()
-        canvas.create_image(0, 0, anchor="nw", image=photo)
+        canvas_img_id = canvas.create_image(disp_w // 2, disp_h // 2, anchor="center", image=photo)
         canvas._photo = photo  # prevent GC
 
-        rect_id = [None]
-        start = [0, 0]
+        # Coordinate translation helper
+        def to_orig_coords(cx, cy):
+            current_scale = win_state.get("current_scale", scale)
+            img_w = int(orig_w * current_scale)
+            img_h = int(orig_h * current_scale)
+            canvas_w = max(1, canvas.winfo_width())
+            canvas_h = max(1, canvas.winfo_height())
+            
+            offset_x = (canvas_w - img_w) // 2
+            offset_y = (canvas_h - img_h) // 2
+            
+            click_x = cx - offset_x
+            click_y = cy - offset_y
+            
+            rx = int(click_x / current_scale)
+            ry = int(click_y / current_scale)
+            return max(0, min(orig_w, rx)), max(0, min(orig_h, ry))
 
+        # Dynamic resizing/redraw helper
+        def redraw_image(cw=None, ch=None):
+            if cw is None:
+                cw = canvas.winfo_width()
+            if ch is None:
+                ch = canvas.winfo_height()
+                
+            if cw <= 1 or ch <= 1:
+                cw, ch = disp_w, disp_h
+                
+            # Calculate dynamic scale based on the available canvas area
+            new_scale = min(cw / orig_w, ch / orig_h)
+            new_w, new_h = int(orig_w * new_scale), int(orig_h * new_scale)
+            win_state["current_scale"] = new_scale
+            
+            base_img = Image.fromarray(frame_rgb)
+            if win_state["current_mask"] is not None:
+                img_rgba = base_img.convert("RGBA")
+                mask_colored = np.zeros((*win_state["current_mask"].shape, 4), dtype=np.uint8)
+                mask_colored[win_state["current_mask"]] = [239, 68, 68, 120] # Translucent red
+                mask_img = Image.fromarray(mask_colored, "RGBA")
+                
+                blended = Image.alpha_composite(img_rgba, mask_img)
+                
+                if win_state["selected_box"]:
+                    bx1, by1, bx2, by2 = win_state["selected_box"]
+                    draw_b = ImageDraw.Draw(blended)
+                    draw_b.rectangle([bx1, by1, bx2, by2], outline=Theme.GREEN_PRIMARY, width=3)
+                base_img = blended
+            
+            resized = base_img.resize((new_w, new_h), Image.LANCZOS)
+            new_photo = ImageTk.PhotoImage(resized)
+            
+            canvas.itemconfig(canvas_img_id, image=new_photo)
+            canvas._photo = new_photo # Prevent GC
+            
+            canvas.coords(canvas_img_id, cw // 2, ch // 2)
+            canvas.itemconfig(canvas_img_id, anchor="center")
+
+        def on_canvas_configure(event):
+            if event.width > 1 and event.height > 1:
+                redraw_image(event.width, event.height)
+                
+        canvas.bind("<Configure>", on_canvas_configure)
+
+        # 2. Control & Mode Toggle Panel (Premium Card look)
+        control_frame = tk.Frame(win, bg=Theme.BG_CARD, highlightthickness=1, highlightbackground=Theme.BORDER_SUBTLE)
+
+        # 3. Status and Instruction Labels
+        instruction_label = tk.Label(control_frame, 
+                                     text="Initializing Smart Click mode...", 
+                                     font=f(Theme.F_BODY_SM, "bold"),
+                                     bg=Theme.BG_CARD, fg=Theme.TEXT_SECONDARY)
+        instruction_label.pack(side="left", padx=Theme.S_MD, pady=Theme.S_SM)
+
+        sam_status_label = tk.Label(control_frame, 
+                                    text="✨ SAM: Loading model...", 
+                                    font=f(Theme.F_META),
+                                    bg=Theme.BG_CARD, fg=Theme.BLUE_PRIMARY)
+        sam_status_label.pack(side="right", padx=Theme.S_MD, pady=Theme.S_SM)
+
+        # 4. Lower Actions Row (Save, Cancel, Mode switches)
+        actions_frame = tk.Frame(win, bg=Theme.BG_OVERLAY)
+
+        # Dock-packing from the bottom up to maintain consistent anchoring
+        actions_frame.pack(side="bottom", fill="x", padx=Theme.S_MD, pady=Theme.S_MD)
+        control_frame.pack(side="bottom", fill="x", padx=Theme.S_MD, pady=(Theme.S_SM, 0))
+        canvas.pack(side="top", fill="both", expand=True)
+
+        def switch_mode(new_mode):
+            win_state["mode"] = new_mode
+            if win_state["rect_id"]:
+                canvas.delete(win_state["rect_id"])
+                win_state["rect_id"] = None
+            
+            if new_mode == "sam":
+                sam_btn.set_style("primary")
+                box_btn.set_style("ghost")
+                if win_state["sam_ready"]:
+                    instruction_label.config(text="Click on any watermark/logo to instantly auto-mask it.", fg=Theme.TEXT_PRIMARY)
+                    canvas.config(cursor="hand2")
+                else:
+                    instruction_label.config(text="Waiting for Smart Click model to load...", fg=Theme.TEXT_MUTED)
+                    canvas.config(cursor="watch")
+            else:
+                sam_btn.set_style("ghost")
+                box_btn.set_style("primary")
+                instruction_label.config(text="Drag a rectangle across the subtitle/watermark area.", fg=Theme.TEXT_PRIMARY)
+                canvas.config(cursor="cross")
+                # Clear precise mask on returning to manual mode
+                win_state["current_mask"] = None
+                win_state["selected_box"] = None
+                redraw_image()
+
+        # Mode Buttons
+        mode_label = tk.Label(actions_frame, text="Select Mode:", font=f(Theme.F_META, "bold"), bg=Theme.BG_OVERLAY, fg=Theme.TEXT_MUTED)
+        mode_label.pack(side="left", padx=(0, Theme.S_XS))
+
+        sam_btn = ModernButton(actions_frame, text="Smart Click", command=lambda: switch_mode("sam"), width=96, style="primary", size="sm")
+        sam_btn.pack(side="left")
+
+        box_btn = ModernButton(actions_frame, text="Manual Box", command=lambda: switch_mode("box"), width=96, style="ghost", size="sm")
+        box_btn.pack(side="left", padx=Theme.S_XS)
+
+        # Action Buttons (Cancel / Save)
+        def save_and_close():
+            mask_path = Path(os.environ.get("APPDATA", Path.home())) / "VideoSubtitleRemoverPro" / "sam_mask.png"
+            if win_state["mode"] == "sam" and win_state.get("current_mask") is not None:
+                try:
+                    import cv2 as _cv2
+                    import numpy as np
+                    mask_uint8 = (win_state["current_mask"] * 255).astype(np.uint8)
+                    mask_path.parent.mkdir(parents=True, exist_ok=True)
+                    _cv2.imwrite(str(mask_path), mask_uint8)
+                    self.config.sam_mask_path = str(mask_path)
+                    logger.info(f"SAM precise mask saved to: {mask_path}")
+                except Exception as ex:
+                    logger.error(f"Failed to save SAM precise mask: {ex}")
+                    self.config.sam_mask_path = None
+            else:
+                self.config.sam_mask_path = None
+                if mask_path.exists():
+                    try:
+                        mask_path.unlink()
+                    except Exception:
+                        pass
+
+            if win_state["selected_box"]:
+                self.config.subtitle_area = win_state["selected_box"]
+                self._update_region_label_display()
+                self._update_status("Subtitle region successfully updated", "success")
+                logger.info(f"Subtitle region set: {win_state['selected_box']}")
+            cleanup_and_destroy()
+
+        def cleanup_and_destroy():
+            logger.info("Cleaning up SAM resources...")
+            win_state["segmentor"] = None
+            # Force cleanup of PyTorch & CUDA VRAM
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            win.destroy()
+
+        save_btn = ModernButton(actions_frame, text="Save & Apply", command=save_and_close, width=110, style="success", size="sm")
+        save_btn.pack(side="right")
+
+        cancel_btn = ModernButton(actions_frame, text="Cancel", command=cleanup_and_destroy, width=76, style="secondary", size="sm")
+        cancel_btn.pack(side="right", padx=Theme.S_XS)
+
+        # Enable/Disable Save Button state
+        def update_save_state():
+            # In box mode, we auto-save upon release, but in SAM click mode, we use Save button
+            pass
+
+        # 5. Background Thread Loader for SAM
+        def load_sam_worker():
+            try:
+                import torch
+                device = "cuda:0" if self.config.use_gpu and torch.cuda.is_available() else "cpu"
+                from backend.sam_segmentor import SAMSegmentor
+                
+                segmentor = SAMSegmentor(device=device)
+                segmentor.set_image(frame_rgb)
+                
+                if win.winfo_exists():
+                    win_state["segmentor"] = segmentor
+                    win_state["sam_ready"] = True
+                    win.after(0, on_sam_loaded)
+            except Exception as e:
+                logger.error(f"Failed to load SAM background model: {e}")
+                if win.winfo_exists():
+                    win.after(0, on_sam_failed)
+
+        def on_sam_loaded():
+            sam_status_label.config(text="✨ SAM: Ready", fg=Theme.SUCCESS)
+            if win_state["mode"] == "sam":
+                instruction_label.config(text="Click on any watermark/logo to instantly auto-mask it.", fg=Theme.TEXT_PRIMARY)
+                canvas.config(cursor="hand2")
+
+        def on_sam_failed():
+            sam_status_label.config(text="✨ SAM: Load Failed", fg=Theme.ERROR)
+            switch_mode("box")
+
+        # Start loading SAM asynchronously
+        threading.Thread(target=load_sam_worker, daemon=True).start()
+
+        # 6. Mouse Event Handlers
         def on_press(event):
-            start[0], start[1] = event.x, event.y
-            if rect_id[0]:
-                canvas.delete(rect_id[0])
-            # Draw a fill hint + outline for premium feel
-            rect_id[0] = canvas.create_rectangle(
-                event.x, event.y, event.x, event.y,
-                outline=Theme.GREEN_PRIMARY, width=2,
-                stipple="gray25", fill=Theme.GREEN_PRIMARY,
-            )
+            win_state["start"][0], win_state["start"][1] = event.x, event.y
+            
+            if win_state["mode"] == "box":
+                if win_state["rect_id"]:
+                    canvas.delete(win_state["rect_id"])
+                # Draw selection box
+                win_state["rect_id"] = canvas.create_rectangle(
+                    event.x, event.y, event.x, event.y,
+                    outline=Theme.GREEN_PRIMARY, width=2,
+                    stipple="gray25", fill=Theme.GREEN_PRIMARY,
+                )
+            elif win_state["mode"] == "sam":
+                if not win_state["sam_ready"]:
+                    self._update_status("Smart Click model is still loading, please wait...", "warning")
+                    return
+                
+                # Retrieve click coordinates mapped safely to centered image
+                orig_x, orig_y = to_orig_coords(event.x, event.y)
+                
+                sam_status_label.config(text="✨ SAM: Segmenting...", fg=Theme.BLUE_PRIMARY)
+                win.update_idletasks()
+                
+                try:
+                    import numpy as np
+                    # Run segmentation in main thread (takes <100ms since embeddings are pre-computed)
+                    mask = win_state["segmentor"].segment_at_point(orig_x, orig_y)
+                    
+                    # Compute bounding box from mask
+                    y_indices, x_indices = np.where(mask)
+                    if len(x_indices) > 0 and len(y_indices) > 0:
+                        x1 = int(np.min(x_indices))
+                        y1 = int(np.min(y_indices))
+                        x2 = int(np.max(x_indices))
+                        y2 = int(np.max(y_indices))
+                        win_state["selected_box"] = (x1, y1, x2, y2)
+                        win_state["current_mask"] = mask
+                        
+                        # Re-render with new mask overlay
+                        redraw_image()
+                        
+                        sam_status_label.config(text="✨ SAM: Mask Generated", fg=Theme.SUCCESS)
+                        logger.info(f"SAM Auto-mask created: ({x1}, {y1}) to ({x2}, {y2})")
+                    else:
+                        sam_status_label.config(text="✨ SAM: No object detected", fg=Theme.ERROR)
+                except Exception as ex:
+                    logger.error(f"SAM segmentation failed: {ex}")
+                    sam_status_label.config(text="✨ SAM: Error", fg=Theme.ERROR)
 
         def on_drag(event):
-            if rect_id[0]:
-                canvas.coords(rect_id[0], start[0], start[1], event.x, event.y)
+            if win_state["mode"] == "box" and win_state["rect_id"]:
+                canvas.coords(win_state["rect_id"], win_state["start"][0], win_state["start"][1], event.x, event.y)
 
         def on_release(event):
-            x1 = int(min(start[0], event.x) / scale)
-            y1 = int(min(start[1], event.y) / scale)
-            x2 = int(max(start[0], event.x) / scale)
-            y2 = int(max(start[1], event.y) / scale)
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(orig_w, x2), min(orig_h, y2)
-            if (x2 - x1) > 10 and (y2 - y1) > 5:
-                self.config.subtitle_area = (x1, y1, x2, y2)
-                self._update_region_label_display()
-                self._update_status("Manual subtitle region saved", "success")
-                logger.info(f"Subtitle region set: ({x1}, {y1}, {x2}, {y2})")
-            win.destroy()
+            if win_state["mode"] == "box":
+                # Translate canvas drag box relative to dynamic scale and centering
+                x1, y1 = to_orig_coords(win_state["start"][0], win_state["start"][1])
+                x2, y2 = to_orig_coords(event.x, event.y)
+                x1, x2 = min(x1, x2), max(x1, x2)
+                y1, y2 = min(y1, y2), max(y1, y2)
+                if (x2 - x1) > 10 and (y2 - y1) > 5:
+                    win_state["selected_box"] = (x1, y1, x2, y2)
+                    save_and_close()
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
-        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Escape>", lambda e: cleanup_and_destroy())
+        win.protocol("WM_DELETE_WINDOW", cleanup_and_destroy)
 
-        hint_frame = tk.Frame(win, bg=Theme.BG_OVERLAY)
-        hint_frame.pack(fill="x", pady=Theme.S_MD)
-        tk.Label(hint_frame,
-                 text="Drag across the subtitle area.",
-                 font=f(Theme.F_BODY_SM, "bold"),
-                 bg=Theme.BG_OVERLAY, fg=Theme.TEXT_PRIMARY).pack()
-        tk.Label(hint_frame,
-                 text="Press Escape to cancel without saving.",
-                 font=f(Theme.F_META),
-                 bg=Theme.BG_OVERLAY, fg=Theme.TEXT_MUTED).pack(pady=(2, 0))
+        # Set default active mode to "sam"
+        switch_mode("sam")
+
+        # Mathematically calculate the perfect initial window size to match the video frame and controls
+        init_w = disp_w
+        init_h = disp_h + _scaled(self.root, 110)
+        win.geometry(f"{init_w}x{init_h}")
+        win.minsize(init_w, init_h)
 
         win.transient(self.root)
         win.grab_set()
@@ -6588,6 +6842,7 @@ class VideoSubtitleRemoverApp:
                 tbe_scene_cut_threshold=getattr(item.config, 'tbe_scene_cut_threshold', 0.35),
                 edge_ring_px=getattr(item.config, 'edge_ring_px', 2),
                 subtitle_areas=getattr(item.config, 'subtitle_areas', None),
+                sam_mask_path=getattr(item.config, 'sam_mask_path', None),
                 export_srt=getattr(item.config, 'export_srt', False),
                 export_mask_video=getattr(item.config, 'export_mask_video', False),
                 adaptive_batch=getattr(item.config, 'adaptive_batch', True),
