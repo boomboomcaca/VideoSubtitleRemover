@@ -5616,6 +5616,7 @@ class VideoSubtitleRemoverApp:
         win.title("Set Subtitle/Watermark Region")
         win.configure(bg=Theme.BG_OVERLAY)
         win.resizable(True, True)  # Allow resizing to prevent clipping under extreme scaling
+        win.pack_propagate(False)  # Disable propagation to prevent infinite layout feedback loops under Aspect Fill
 
         # Local window state
         win_state = {
