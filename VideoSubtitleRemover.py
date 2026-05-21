@@ -3030,7 +3030,20 @@ class VideoSubtitleRemoverApp:
         with self.queue_lock:
             for item in self.queue:
                 if item.status == ProcessingStatus.IDLE:
+                    # Preserve item-specific region / mask selections
+                    orig_area = item.config.subtitle_area
+                    orig_mask = getattr(item.config, "sam_mask_path", None)
+                    orig_areas = getattr(item.config, "subtitle_areas", None)
+
                     item.config = ProcessingConfig.from_dict(snapshot.to_dict())
+
+                    if orig_area is not None:
+                        item.config.subtitle_area = orig_area
+                    if orig_mask is not None:
+                        item.config.sam_mask_path = orig_mask
+                    if orig_areas is not None:
+                        item.config.subtitle_areas = orig_areas
+
                     updated += 1
         output_updates = self._refresh_idle_output_paths()
         if output_updates:
@@ -5801,7 +5814,12 @@ class VideoSubtitleRemoverApp:
 
         # Action Buttons (Cancel / Save)
         def save_and_close():
-            mask_path = Path(os.environ.get("APPDATA", Path.home())) / "VideoSubtitleRemoverPro" / "sam_mask.png"
+            selected = self._get_selected_queue_item()
+            import uuid
+            mask_id = str(uuid.uuid4())[:8]
+            mask_filename = f"sam_mask_{mask_id}.png"
+            mask_path = Path(os.environ.get("APPDATA", Path.home())) / "VideoSubtitleRemoverPro" / mask_filename
+            
             if win_state["mode"] == "sam" and win_state.get("current_mask") is not None:
                 try:
                     import cv2 as _cv2
@@ -5809,21 +5827,25 @@ class VideoSubtitleRemoverApp:
                     mask_uint8 = (win_state["current_mask"] * 255).astype(np.uint8)
                     mask_path.parent.mkdir(parents=True, exist_ok=True)
                     _cv2.imwrite(str(mask_path), mask_uint8)
+                    
                     self.config.sam_mask_path = str(mask_path)
+                    if selected:
+                        selected.config.sam_mask_path = str(mask_path)
                     logger.info(f"SAM precise mask saved to: {mask_path}")
                 except Exception as ex:
                     logger.error(f"Failed to save SAM precise mask: {ex}")
                     self.config.sam_mask_path = None
+                    if selected:
+                        selected.config.sam_mask_path = None
             else:
                 self.config.sam_mask_path = None
-                if mask_path.exists():
-                    try:
-                        mask_path.unlink()
-                    except Exception:
-                        pass
+                if selected:
+                    selected.config.sam_mask_path = None
 
             if win_state["selected_box"]:
                 self.config.subtitle_area = win_state["selected_box"]
+                if selected:
+                    selected.config.subtitle_area = win_state["selected_box"]
                 self._update_region_label_display()
                 self._update_status("Subtitle region successfully updated", "success")
                 logger.info(f"Subtitle region set: {win_state['selected_box']}")
@@ -5974,7 +5996,12 @@ class VideoSubtitleRemoverApp:
 
     def _reset_region(self):
         """Reset subtitle region to auto-detect."""
+        selected = self._get_selected_queue_item()
         self.config.subtitle_area = None
+        self.config.sam_mask_path = None
+        if selected:
+            selected.config.subtitle_area = None
+            selected.config.sam_mask_path = None
         self._update_region_label_display()
         self._update_status("Subtitle detection returned to automatic mode")
 
