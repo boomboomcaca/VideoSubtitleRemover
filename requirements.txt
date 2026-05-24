@@ -42,3 +42,19 @@ simple-lama-inpainting>=0.1.0
 
 # GUI Enhancement (optional)
 # tkinterdnd2>=0.3.0  # For native drag-drop support
+
+# Dynamic Watermark Mode (header button + tool/dynamic_inpaint_cli.py)
+# --------------------------------------------------------------------
+# The experimental moving-watermark pipeline shells out to a sibling
+# watermark_remover project's bundled conda env -- ProPainter's heavy
+# deps (transformers, groundingdino's CUDA-compiled ops, av, einops,
+# scikit-image, timm) intentionally are NOT pulled into this venv.
+#
+# Setup steps:
+#   1. Clone a watermark_remover checkout next to this repo
+#      (or anywhere accessible) and run its installer so env/python.exe
+#      and ckpt/R50_DeAOTL_PRE_YTB_DAV.pth exist.
+#   2. Either place it at ../watermark_remover, or set
+#      VSR_WATERMARK_REMOVER_PATH to its absolute path.
+#   3. Verify with:  python -m tool.check_dynamic_mode
+#   4. Launch VSR Pro and click "Watermark Mode" in the header.

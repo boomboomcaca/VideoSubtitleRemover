@@ -6,6 +6,48 @@ All notable changes to VideoSubtitleRemover will be documented in this file.
 
 ### Added
 
+- **Experimental: Dynamic Watermark Mode (header button + popup
+  window)** -- VSR Pro now ships a moving-watermark removal workflow
+  alongside the existing static-region subtitle flow. Click "Watermark
+  Mode" in the header to open a self-contained window that drives a
+  SAM (click-driven first-frame segmentation) + DeAOT/SegTracker
+  (per-frame mask propagation) + ProPainter (optical-flow-guided video
+  inpainting) pipeline. Left-click in the canvas adds a positive point
+  (this IS the watermark, green dot), right-click adds a negative
+  point (this is NOT the watermark, red dot); one positive is usually
+  enough. Auto-crop is on by default and is the difference between a
+  10-minute job and a 90-minute job on consumer 12 GB GPUs -- the
+  pipeline computes the tracked-mask bounding box, runs ProPainter on
+  the cropped region (typically a 200-400 px square), then ffmpeg
+  overlays the inpainted patch back onto the original video.
+- **Worker fixes baked in** -- the dynamic worker now (a) moves the
+  `*_new.png` auxiliary masks SegTracker writes every sam_gap frames
+  out of the way (they trigger a mask/frame count mismatch and a
+  pre-inpaint tensor-shape crash); (b) disables SegTracker's
+  "segment everything" re-detection by forcing `sam_gap` to a huge
+  number, which prevents the object-id corruption that otherwise
+  scatters obj=1 mask pixels across 99% of the frame at sam_gap
+  boundaries; (c) frees GPU memory between DeAOT and ProPainter to
+  avoid `CUDNN_STATUS_MAPPING_ERROR` at the first optical-flow call.
+- **Structured progress callbacks** -- the worker emits stable
+  `PROGRESS phase value [extra]` sentinels for nine phases (loading,
+  sam, deaot, mask_cleanup, bbox, crop, propainter, overlay, done).
+  `backend.dynamic.run_dynamic_removal(progress_callback=...)`
+  forwards parsed events with an overall-progress estimate computed
+  from observed phase wall-time weights. The CLI prints a phase bar
+  by default (`--no-progress` to suppress); the Watermark Mode window
+  uses it to drive its progress bar.
+- **`tool/check_dynamic_mode.py`** -- preflight script that verifies
+  the sibling `watermark_remover` checkout is present and complete
+  (SegTracker, ProPainter, the bundled env/python.exe, the DeAOT R50
+  checkpoint, ffmpeg). Exit code 0 = ready, 1 = no sibling, 2 =
+  incomplete. Vendoring the full dependency stack in-tree is deferred
+  to v3.13 (groundingdino's CUDA-compiled kernels and transformers'
+  ~1 GB install footprint are not a fit for the main venv).
+- **`tool/dynamic_inpaint_cli.py`** -- the underlying command-line
+  entry, unchanged from the phase-A MVP except it now picks up
+  auto-crop + progress automatically. See its `--help` for the full
+  flag list.
 - **Karaoke / per-syllable grouping (`--karaoke-grouping`)** -- new
   `_group_horizontal_line()` helper fuses OCR boxes on the same
   horizontal text line into a single composite. Karaoke captions

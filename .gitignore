@@ -35,6 +35,7 @@ models/*.pt
 models/*.onnx
 models/*.bin
 !models/README.txt
+weights/
 
 # Environment
 .env

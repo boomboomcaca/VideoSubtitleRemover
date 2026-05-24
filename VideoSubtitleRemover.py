@@ -3685,11 +3685,22 @@ class VideoSubtitleRemoverApp:
         self._create_chip(chips, "Audio", audio_short, audio_fg, Theme.BG_CARD).pack(
             side="left", padx=(Theme.S_SM, 0))
 
+        # Dynamic watermark removal -- experimental SAM+DeAOT+ProPainter
+        # pipeline. Opens a self-contained sub-window so it can't break the
+        # main static-subtitle flow.
+        wm_btn = ModernButton(
+            right_row, text="Watermark Mode", width=140,
+            command=self._open_dynamic_watermark_window,
+            style="ghost", size="sm",
+        )
+        wm_btn.pack(side="left", padx=(Theme.S_MD, 0))
+        self._header_watermark_btn = wm_btn
+
         # About / help button placed on the same line next to chips
         help_btn = ModernButton(right_row, text="Help", width=70,
                                 command=self._show_about, style="ghost",
                                 size="sm", icon="?")
-        help_btn.pack(side="left", padx=(Theme.S_MD, 0))
+        help_btn.pack(side="left", padx=(Theme.S_SM, 0))
         self._header_help_btn = help_btn
 
         # Row 2 of Right: Compact workflow step pills and single compact guidance text
@@ -5381,6 +5392,185 @@ class VideoSubtitleRemoverApp:
         dialog.deiconify()
         dialog.grab_set()
 
+    def _open_dynamic_watermark_window(self):
+        """Open the existing region selector in *dynamic-mode*.
+
+        Same Smart Click / Manual Box / Aspect Fit UX the user already
+        knows from the static-subtitle flow -- the only differences are
+        the window title, the primary button label ("Remove Watermark"),
+        and what happens on Save: instead of persisting the mask for
+        a future static-pipeline run, we immediately launch
+        SAM + DeAOT + ProPainter on the chosen region.
+        """
+        self._open_region_selector(dynamic_mode=True)
+
+    def _launch_dynamic_pipeline_from_region(self, source_path, mask, bbox):
+        """Kick off the dynamic SAM+DeAOT+ProPainter pipeline.
+
+        Called from the region-selector's Save & Apply handler when the
+        window was opened with ``dynamic_mode=True``. The user has
+        already drawn either a Smart Click mask (preferred -- we use
+        its centroid as the SAM positive click for the worker's
+        first-frame re-segmentation) or a Manual Box (we use the box
+        centre). The worker's own SAM call on the first frame
+        regenerates the mask precisely; the click we pass it just
+        steers SAM to the right object.
+        """
+        import numpy as np
+        from pathlib import Path as _Path
+        try:
+            from backend.dynamic import (
+                resolve_watermark_remover_path, run_dynamic_removal,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Dynamic pipeline import failed")
+            tk.messagebox.showerror(
+                "Dynamic watermark removal unavailable",
+                f"{type(e).__name__}: {e}", parent=self.root,
+            )
+            return
+
+        # Pick a positive click for the worker's SAM call
+        click_xy = None
+        if mask is not None:
+            ys, xs = np.where(mask)
+            if xs.size > 0:
+                click_xy = (int(np.median(xs)), int(np.median(ys)))
+        if click_xy is None and bbox is not None:
+            x1, y1, x2, y2 = bbox
+            click_xy = ((x1 + x2) // 2, (y1 + y2) // 2)
+        if click_xy is None:
+            tk.messagebox.showwarning(
+                "No region selected",
+                "Click on the watermark (Smart Click) or drag a box "
+                "(Manual Box) before pressing Remove Watermark.",
+                parent=self.root,
+            )
+            return
+
+        # Resolve sibling watermark_remover project
+        try:
+            wm_path = resolve_watermark_remover_path()
+        except FileNotFoundError as e:
+            logger.error("watermark_remover discovery failed: %s", e)
+            tk.messagebox.showerror(
+                "watermark_remover not found",
+                f"{e}\n\nRun 'python -m tool.check_dynamic_mode' for "
+                "setup instructions.",
+                parent=self.root,
+            )
+            return
+
+        src = _Path(source_path)
+        out = src.with_name(f"{src.stem}_clean.mp4")
+
+        # Build a small progress Toplevel
+        prog_win = tk.Toplevel(self.root)
+        prog_win.title("Removing watermark...")
+        prog_win.configure(bg=Theme.BG_OVERLAY)
+        prog_win.geometry("520x180")
+        prog_win.transient(self.root)
+        tk.Label(
+            prog_win, text=f"Source: {src.name}",
+            font=f(Theme.F_BODY, "bold"),
+            bg=Theme.BG_OVERLAY, fg=Theme.TEXT_PRIMARY,
+            anchor="w",
+        ).pack(fill="x", padx=Theme.S_LG, pady=(Theme.S_LG, Theme.S_XS))
+        status_lbl = tk.Label(
+            prog_win, text="Starting...",
+            font=f(Theme.F_META),
+            bg=Theme.BG_OVERLAY, fg=Theme.TEXT_SECONDARY,
+            anchor="w", justify="left", wraplength=480,
+        )
+        status_lbl.pack(fill="x", padx=Theme.S_LG)
+
+        bar_canvas = tk.Canvas(prog_win, bg=Theme.BG_TERTIARY,
+                               height=10, highlightthickness=0)
+        bar_canvas.pack(fill="x", padx=Theme.S_LG, pady=Theme.S_SM)
+        bar_id = bar_canvas.create_rectangle(
+            0, 0, 0, 10, fill=Theme.GREEN_PRIMARY, width=0,
+        )
+        bar_canvas.bind(
+            "<Configure>",
+            lambda e: bar_canvas.coords(bar_id, 0, 0,
+                                        int(prog_win._dyn_progress * e.width), 10),
+        )
+        prog_win._dyn_progress = 0.0
+
+        close_btn_var = {"btn": None}
+
+        def _set_progress(phase, value, extra, overall):
+            def apply():
+                prog_win._dyn_progress = overall
+                w = bar_canvas.winfo_width()
+                bar_canvas.coords(bar_id, 0, 0, int(overall * w), 10)
+                label_map = {
+                    "loading": "Loading SAM + DeAOT...",
+                    "sam": "First-frame segmentation",
+                    "deaot": "Tracking watermark across frames (slow)",
+                    "mask_cleanup": "Cleaning masks",
+                    "bbox": "Computing crop bounding box",
+                    "crop": "Cropping video + masks",
+                    "propainter": "Inpainting (ProPainter)",
+                    "overlay": "Compositing result",
+                    "done": "Done",
+                }
+                status_lbl.config(
+                    text=f"[{int(overall*100):3d}%]  "
+                         f"{label_map.get(phase, phase)}"
+                         + (f"  ({extra})" if extra else ""),
+                )
+            try:
+                prog_win.after(0, apply)
+            except Exception:
+                pass
+
+        def _bg():
+            try:
+                result = run_dynamic_removal(
+                    video=src, clicks=[(click_xy[0], click_xy[1], 1)],
+                    output=out, wm_path=wm_path,
+                    auto_crop=True, fp16=True,
+                    progress_callback=_set_progress,
+                )
+                self.root.after(0, lambda: _done(result.output_video))
+            except Exception as e:  # noqa: BLE001
+                logger.exception("Dynamic pipeline failed")
+                self.root.after(0, lambda exc=e: _failed(exc))
+
+        def _done(out_path):
+            status_lbl.config(text=f"Done -> {out_path}", fg=Theme.SUCCESS)
+            # ModernButton is a tk.Canvas subclass that ignores tk's
+            # .config(text=...) -- it stores label in self.text and only
+            # repaints via .set_text(). Command is a plain attribute.
+            btn = close_btn_var["btn"]
+            if btn:
+                btn.set_text("Open Folder")
+                btn.command = lambda: _reveal(out_path)
+
+        def _failed(exc):
+            status_lbl.config(text=f"Failed: {exc}", fg=Theme.ERROR)
+            btn = close_btn_var["btn"]
+            if btn:
+                btn.set_text("Close")
+                btn.command = prog_win.destroy
+
+        def _reveal(path):
+            import subprocess as _sp
+            _sp.Popen(["explorer", "/select,", str(path)])
+            prog_win.destroy()
+
+        btn_row = tk.Frame(prog_win, bg=Theme.BG_OVERLAY)
+        btn_row.pack(fill="x", padx=Theme.S_LG, pady=(Theme.S_SM, Theme.S_LG))
+        close_btn = ModernButton(
+            btn_row, text="Hide", command=prog_win.destroy,
+            style="secondary", size="sm", width=120,
+        )
+        close_btn.pack(side="right")
+        close_btn_var["btn"] = close_btn
+
+        threading.Thread(target=_bg, daemon=True).start()
+
     def _show_about(self):
         """Open a themed About dialog with version, credits, and quick links."""
         dialog = tk.Toplevel(self.root)
@@ -5545,8 +5735,15 @@ class VideoSubtitleRemoverApp:
         except Exception as e:
             logger.warning(f"Failed to clean up old SAM mask files: {e}")
 
-    def _open_region_selector(self):
-        """Open a window to draw a subtitle region rectangle on the first frame."""
+    def _open_region_selector(self, dynamic_mode: bool = False):
+        """Open a window to draw a subtitle region rectangle on the first frame.
+
+        When ``dynamic_mode`` is True the window's title and primary
+        action are relabelled and Save & Apply triggers the experimental
+        dynamic-watermark pipeline (SAM mask -> DeAOT tracking ->
+        ProPainter inpainting) instead of just persisting the mask path
+        for the static-subtitle flow.
+        """
         import numpy as np
         # Use the selected queue item first, then fall back to the first queued file.
         source_path = None
@@ -5656,7 +5853,8 @@ class VideoSubtitleRemoverApp:
 
         # Create Toplevel window
         win = tk.Toplevel(self.root)
-        win.title("Set Subtitle/Watermark Region")
+        win.title("Set Dynamic Watermark Region" if dynamic_mode
+                  else "Set Subtitle/Watermark Region")
         win.configure(bg=Theme.BG_OVERLAY)
         win.resizable(True, True)  # Allow resizing to prevent clipping under extreme scaling
         win.pack_propagate(False)  # Disable propagation to prevent infinite layout feedback loops under Aspect Fill
@@ -5928,6 +6126,18 @@ class VideoSubtitleRemoverApp:
                 self._update_region_label_display()
                 self._update_status("Subtitle region successfully updated", "success")
                 logger.info(f"Subtitle region set: {win_state['selected_box']}")
+
+            # Dynamic-watermark branch: instead of just persisting the
+            # mask for the static pipeline, kick off the experimental
+            # SAM+DeAOT+ProPainter removal in a background thread and
+            # close the window. A separate progress Toplevel will show
+            # phase updates and the final result location.
+            if dynamic_mode:
+                self._launch_dynamic_pipeline_from_region(
+                    source_path=source_path,
+                    mask=win_state.get("current_mask"),
+                    bbox=win_state.get("selected_box"),
+                )
             cleanup_and_destroy()
 
         def cleanup_and_destroy():
@@ -5950,7 +6160,13 @@ class VideoSubtitleRemoverApp:
                 torch.cuda.empty_cache()
             win.destroy()
 
-        save_btn = ModernButton(actions_frame, text="Save & Apply", command=save_and_close, width=110, style="success", size="sm")
+        save_btn = ModernButton(
+            actions_frame,
+            text="Remove Watermark" if dynamic_mode else "Save & Apply",
+            command=save_and_close,
+            width=140 if dynamic_mode else 110,
+            style="success", size="sm",
+        )
         save_btn.pack(side="right")
 
         cancel_btn = ModernButton(actions_frame, text="Cancel", command=cleanup_and_destroy, width=76, style="secondary", size="sm")

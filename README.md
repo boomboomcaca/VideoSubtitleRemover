@@ -160,6 +160,74 @@ python -m backend.processor -i input.mp4 -o output.mp4 -m lama --lang en --crf 2
 | `--mask-dilate N` | Expand masks by N pixels | 8 |
 | `--no-hw-encode` | Force software encoding (libx264) | Off |
 
+## Dynamic Watermark Mode (Experimental)
+
+A **moving** watermark / logo can be removed in addition to fixed-region
+subtitles. Click **"Watermark Mode"** in the top-right of the header to
+open the workflow. The pipeline is **SAM** (click-driven first-frame
+segmentation) -> **DeAOT/SegTracker** (per-frame mask propagation)
+-> **ProPainter** (optical-flow-guided video inpainting), with
+**auto-crop** (compute the tracked-mask bounding box, run ProPainter on
+just that region, then ffmpeg-overlay the inpaint back onto the
+original) for a 5-10x speedup on consumer GPUs.
+
+### Workflow
+
+1. Click **Watermark Mode** in the header. The dynamic-watermark window
+   opens.
+2. **Browse...** -> pick the input video. The first frame is shown.
+3. **Click** on the watermark:
+   - **Left-click** = positive (this IS the watermark, green dot)
+   - **Right-click** = negative (this is NOT the watermark, red dot)
+   - One positive in the centre is usually enough.
+4. **Run.** Progress shows the active phase (Loading, Segmenting,
+   Tracking, Inpainting, Compositing). Typical timing on a 12 GB GPU
+   for a 10s 1080p clip with a small logo: **~6-10 minutes**.
+5. **Open output folder** when done. Output is `<input>_clean.mp4` next
+   to the source by default.
+
+### Setup (one time)
+
+The pipeline reuses a sibling **watermark_remover** project's bundled
+conda env so we do not have to install ProPainter's CUDA-compiled
+groundingdino and ~1 GB transformers stack into VSR Pro's venv.
+
+1. Clone `watermark_remover` somewhere on disk and run its installer so
+   `env/python.exe`, `ProPainter/`, and `ckpt/R50_DeAOTL_PRE_YTB_DAV.pth`
+   all exist.
+2. Place it at `../watermark_remover` (next to this repo) or set the
+   `VSR_WATERMARK_REMOVER_PATH` env var to its absolute path.
+3. Verify:
+   ```powershell
+   python -m tool.check_dynamic_mode
+   ```
+   You should see `[READY] Dynamic Watermark Mode is fully configured.`
+
+If the sibling is missing or incomplete, the Watermark Mode window
+opens with a clear error in its status bar and the **Run** button stays
+disabled. Static-subtitle removal works regardless.
+
+### CLI (for batch / scripting)
+
+```powershell
+python -m tool.dynamic_inpaint_cli `
+  --video sample.mp4 `
+  --points "640,360+;700,360+;500,200-" `
+  --output sample_clean.mp4
+```
+
+Key flags:
+
+| Flag | Description |
+|------|-------------|
+| `--points "x,y+;x,y-"` | First-frame clicks; `+` positive, `-` negative |
+| `--auto-crop / --no-auto-crop` | Crop+overlay vs full frame (default on) |
+| `--crop-padding N` | Pixels of context around bbox (default 96) |
+| `--fp16 / --no-fp16` | ProPainter precision (default fp16) |
+| `--subvideo-length N` | ProPainter batch size (default 80 with auto-crop) |
+| `--wm-path PATH` | Override watermark_remover discovery |
+| `--no-progress` | Suppress the phase-progress reporter |
+
 ## Configuration
 
 Settings are stored in `%APPDATA%\VideoSubtitleRemoverPro\settings.json` and persist across sessions.
