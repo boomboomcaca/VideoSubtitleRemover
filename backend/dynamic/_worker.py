@@ -281,21 +281,32 @@ class FfmpegVideoReader:
         self.close()
 
     def _spawn(self) -> None:
-        # We let ffmpeg quietly skip undecodable packets so a single
-        # corrupted frame doesn't take the whole pipe down. The cost
-        # is a frame count that may be slightly less than container
-        # metadata claims (which is fine -- DeAOT just stops there).
+        # ``-err_detect ignore_err`` is the lone "tolerate bad bitstream"
+        # flag we need. We used to also pass ``-fflags +discardcorrupt``
+        # AND ``-vsync passthrough`` for what felt like extra robustness,
+        # but on a 27-min H.264 user video those flags caused ffmpeg to
+        # emit a clean EOF after ~18726 frames (out of 98668), silently
+        # truncating the dynamic-watermark pipeline to ~5 minutes of
+        # output. ffmpeg's own ``-map 0:v:0 -f null -`` test on the
+        # same source processed all 98668 frames once the two flags
+        # were removed, so they were causing the early termination,
+        # not protecting against it.
+        # -hwaccel cuda offloads H.264 / HEVC decode to NVDEC (NVIDIA
+        # hardware decoder). Frames are downloaded to CPU before we
+        # convert to bgr24 (our consumer is numpy on CPU), but the
+        # actual decode cost drops to near-zero. If the GPU isn't
+        # NVIDIA / decoder unavailable, ffmpeg silently falls back to
+        # software decode -- no behaviour change required.
         cmd = [
             self._ffmpeg,
             "-hide_banner",
             "-loglevel", "error",
             "-err_detect", "ignore_err",
-            "-fflags", "+discardcorrupt",
+            "-hwaccel", "cuda",
             "-i", str(self._video),
             "-f", "rawvideo",
             "-pix_fmt", "bgr24",
             "-an",
-            "-vsync", "passthrough",
             "-",
         ]
         log.debug("FfmpegVideoReader spawn: %s", " ".join(cmd))
@@ -436,18 +447,76 @@ def _clean_segtracker_masks(mask_dir: Path) -> int:
         log.info("Moved %d auxiliary _new.png mask(s) to %s",
                  len(aux_masks), aux_dir)
 
+    # Filter each frame to ONLY the connected component closest to
+    # the watermark. DeAOT can drift over long videos -- object-id 1
+    # occasionally leaks to unrelated regions during scene changes /
+    # occlusion / memory bleed. On a real 90-min run this drift blew
+    # the union bounding box from ~135x130 to 1386x1042 (69.6% of the
+    # frame), tripping the "skip auto-crop if bbox > 60%" guard and
+    # dropping the whole pipeline back to 1080p ProPainter (instant
+    # OOM). We use the FIRST frame's mask centroid as the watermark
+    # reference -- frame 0 is the SAM-clicked seed and is always
+    # correct -- then on every subsequent frame keep the CC whose
+    # centroid is closest to that reference. The watermark doesn't
+    # teleport between frames, so this is robust.
+    try:
+        from scipy.ndimage import label as cc_label, center_of_mass
+        have_scipy = True
+    except ImportError:
+        have_scipy = False
+        log.warning("scipy unavailable -- skipping CC-based mask cleanup; "
+                    "DeAOT drift artifacts may bloat the auto-crop bbox")
+
+    # Find the watermark reference centroid from frame 0. The mask
+    # format is palette-PNG with values {0, 1} when fresh from DeAOT,
+    # but the file may already be a binary 0/255 PNG if a previous
+    # cleanup pass ran and we're being invoked again (e.g. via the
+    # resume script). ``arr > 0`` handles both -- DO NOT compare to
+    # the literal value 1, that bricks the masks on the second pass.
+    ref_cy, ref_cx = None, None
+    first_png = mask_dir / "00000.png"
+    if have_scipy and first_png.is_file():
+        arr0 = np.array(Image.open(first_png))
+        binary0 = (arr0 > 0).astype(np.uint8)
+        if binary0.any():
+            ys, xs = np.where(binary0)
+            ref_cy = float(ys.mean())
+            ref_cx = float(xs.mean())
+            log.info("Watermark reference centroid (frame 0): (%.0f, %.0f)",
+                     ref_cx, ref_cy)
+
     rewritten = 0
     max_obj_seen = 0
+    drift_frames = 0
     for png in sorted(mask_dir.glob("*.png")):
         arr = np.array(Image.open(png))
         max_obj_seen = max(max_obj_seen, int(arr.max()))
-        binary = ((arr == 1).astype(np.uint8) * 255)
-        Image.fromarray(binary).save(png)
+        binary = (arr > 0).astype(np.uint8)  # tolerates {0,1} OR {0,255}
+        if have_scipy and binary.any() and ref_cx is not None:
+            labels, n_cc = cc_label(binary)
+            if n_cc > 1:
+                # Compute centroid of each CC, keep the one closest
+                # to the watermark reference. ``center_of_mass`` returns
+                # one tuple per label (1-indexed since label 0 is bg).
+                centroids = center_of_mass(binary, labels, range(1, n_cc + 1))
+                best_label = 1
+                best_dist = float("inf")
+                for i, (cy, cx) in enumerate(centroids, start=1):
+                    d = (cy - ref_cy) ** 2 + (cx - ref_cx) ** 2
+                    if d < best_dist:
+                        best_dist = d
+                        best_label = i
+                kept = (labels == best_label).astype(np.uint8)
+                if kept.sum() < binary.sum():
+                    drift_frames += 1
+                binary = kept
+        Image.fromarray(binary * 255).save(png)
         rewritten += 1
     log.info(
-        "Rewrote %d mask PNGs to object-1-only binary "
+        "Rewrote %d mask PNGs to object-1-only binary; "
+        "discarded DeAOT-drift artifacts in %d frame(s) "
         "(max tracked id observed across video: %d)",
-        rewritten, max_obj_seen,
+        rewritten, drift_frames, max_obj_seen,
     )
     return rewritten
 
@@ -520,8 +589,26 @@ def _compute_bbox(
 def _crop_video(
     src: Path, dst: Path, x: int, y: int, w: int, h: int, ffmpeg: str,
 ) -> None:
-    """Crop *src* to ``w x h`` at offset ``(x, y)``, write to *dst*."""
-    cmd = [
+    """Crop *src* to ``w x h`` at offset ``(x, y)``, write to *dst*.
+
+    NVENC encode (~10-50x faster than libx264 on this hardware) with
+    libx264 fallback if NVENC fails (e.g. driver issue / no NVIDIA GPU).
+    """
+    log.info("ffmpeg crop -> %s (%dx%d at %d,%d)", dst.name, w, h, x, y)
+    cmd_nvenc = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-i", str(src),
+        "-vf", f"crop={w}:{h}:{x}:{y}",
+        "-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "18",
+        "-an",
+        str(dst),
+    ]
+    rc = subprocess.call(cmd_nvenc, creationflags=_NO_WINDOW)
+    if rc == 0 and dst.is_file() and dst.stat().st_size > 1024:
+        return
+    log.warning("NVENC crop failed (rc=%d); falling back to libx264", rc)
+    dst.unlink(missing_ok=True)
+    cmd_x264 = [
         ffmpeg, "-y", "-loglevel", "error",
         "-i", str(src),
         "-vf", f"crop={w}:{h}:{x}:{y}",
@@ -529,8 +616,7 @@ def _crop_video(
         "-an",
         str(dst),
     ]
-    log.info("ffmpeg crop -> %s (%dx%d at %d,%d)", dst.name, w, h, x, y)
-    rc = subprocess.call(cmd, creationflags=_NO_WINDOW)
+    rc = subprocess.call(cmd_x264, creationflags=_NO_WINDOW)
     if rc != 0:
         raise RuntimeError(f"ffmpeg crop failed (exit {rc})")
 
@@ -553,19 +639,46 @@ def _crop_masks(
 def _overlay(
     base: Path, crop: Path, out: Path, x: int, y: int, ffmpeg: str,
 ) -> None:
-    """Overlay *crop* on *base* at ``(x, y)`` -> *out*, preserving audio."""
-    cmd = [
+    """Overlay *crop* on *base* at ``(x, y)`` -> *out*, preserving audio.
+
+    Critical: NO ``-shortest`` flag. If the inpaint stream is shorter
+    than the source (e.g., DeAOT processed fewer frames than the source
+    actually has because the reader EOF'd early), we still want the
+    output to span the full source duration -- the post-inpaint frames
+    just pass through unmodified. ``-shortest`` would truncate the
+    output to the shorter input, which previously cost a user the back
+    22 minutes of a 27-minute video.
+
+    The ``overlay`` filter naturally stops applying once its second
+    input ends, while continuing to forward the base stream.
+    """
+    log.info("ffmpeg overlay %s onto %s at (%d,%d) -> %s",
+             crop.name, base.name, x, y, out.name)
+    overlay_filter = f"[0:v][1:v]overlay={x}:{y}:eof_action=pass"
+    cmd_nvenc = [
         ffmpeg, "-y", "-loglevel", "error",
         "-i", str(base),
         "-i", str(crop),
-        "-filter_complex", f"[0:v][1:v]overlay={x}:{y}",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-c:a", "copy", "-shortest",
+        "-filter_complex", overlay_filter,
+        "-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "18",
+        "-c:a", "copy",
         str(out),
     ]
-    log.info("ffmpeg overlay %s onto %s at (%d,%d) -> %s",
-             crop.name, base.name, x, y, out.name)
-    rc = subprocess.call(cmd, creationflags=_NO_WINDOW)
+    rc = subprocess.call(cmd_nvenc, creationflags=_NO_WINDOW)
+    if rc == 0 and out.is_file() and out.stat().st_size > 1024:
+        return
+    log.warning("NVENC overlay failed (rc=%d); falling back to libx264", rc)
+    out.unlink(missing_ok=True)
+    cmd_x264 = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-i", str(base),
+        "-i", str(crop),
+        "-filter_complex", overlay_filter,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:a", "copy",
+        str(out),
+    ]
+    rc = subprocess.call(cmd_x264, creationflags=_NO_WINDOW)
     if rc != 0:
         raise RuntimeError(f"ffmpeg overlay failed (exit {rc})")
 
@@ -661,6 +774,74 @@ def _run_propainter_single(
     return produced
 
 
+def _reencode_source_clean(
+    src: Path, dst: Path, ffmpeg: str,
+) -> None:
+    """Re-encode *src* into a robust intermediate at *dst*.
+
+    Some user videos -- even nominally-valid H.264 ones -- have decode
+    quirks (corrupt packets, timestamp discontinuities, B-frame
+    references to dropped I-frames) that don't surface when ffmpeg
+    runs in standalone mode, but DO surface as early EOF when feeding
+    raw bgr24 through a slow Python consumer pipe. The decoder gives
+    up after a few thousand frames and our pipeline silently truncates.
+
+    Fix: BEFORE running DeAOT, transcode the source into a clean
+    intermediate that decodes end-to-end without back-pressure issues.
+    Costs a few minutes up front but eliminates the silent truncation.
+
+    Tries NVENC first (fast hardware encode on NVIDIA GPUs), falls back
+    to libx264 ultrafast if NVENC is unavailable or fails. Quality
+    setting is high (CQ/CRF 16-18) so the intermediate is visually
+    indistinguishable from the source -- downstream DeAOT + ProPainter
+    operate on this, and the final overlay also uses this as the base
+    so user-perceived quality matches the intermediate.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # NVENC first
+    cmd_nvenc = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-err_detect", "ignore_err",
+        "-fflags", "+discardcorrupt",
+        "-i", str(src),
+        "-c:v", "h264_nvenc",
+        "-preset", "p5",
+        "-rc", "vbr",
+        "-cq", "18",
+        "-c:a", "copy",
+        str(dst),
+    ]
+    log.info("Pre-encoding source to robust intermediate (NVENC)...")
+    rc = subprocess.call(cmd_nvenc, creationflags=_NO_WINDOW)
+    if rc == 0 and dst.is_file() and dst.stat().st_size > 1024:
+        log.info("NVENC pre-encode succeeded -> %s (%.1f MB)",
+                 dst.name, dst.stat().st_size / 1e6)
+        return
+
+    log.warning("NVENC failed (rc=%d), falling back to libx264 ultrafast...", rc)
+    # Clean up partial NVENC output
+    dst.unlink(missing_ok=True)
+    cmd_x264 = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-err_detect", "ignore_err",
+        "-fflags", "+discardcorrupt",
+        "-i", str(src),
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "16",
+        "-c:a", "copy",
+        str(dst),
+    ]
+    rc = subprocess.call(cmd_x264, creationflags=_NO_WINDOW)
+    if rc != 0 or not dst.is_file() or dst.stat().st_size < 1024:
+        raise RuntimeError(
+            f"Source pre-encode failed (libx264 rc={rc}, "
+            f"output exists={dst.is_file()}). Cannot continue."
+        )
+    log.info("libx264 pre-encode succeeded -> %s (%.1f MB)",
+             dst.name, dst.stat().st_size / 1e6)
+
+
 def _ffmpeg_slice_video(
     src: Path, dst: Path, start_frame: int, n_frames: int, ffmpeg: str,
 ) -> None:
@@ -671,17 +852,35 @@ def _ffmpeg_slice_video(
     rebase timestamps so the chunk plays from t=0.
     """
     last = start_frame + n_frames - 1
-    cmd = [
+    vf = (f"select=between(n\\,{start_frame}\\,{last}),"
+          f"setpts=PTS-STARTPTS")
+    # NVENC first -- consistent with the rest of the pipeline
+    # (reencode, crop, overlay all NVENC). On a 62-chunk run the
+    # cumulative slice cost drops from ~2 min libx264 -> ~10 s NVENC.
+    cmd_nvenc = [
         ffmpeg, "-y", "-loglevel", "error",
         "-i", str(src),
-        "-vf", f"select=between(n\\,{start_frame}\\,{last}),"
-               f"setpts=PTS-STARTPTS",
+        "-vf", vf,
+        "-vsync", "vfr",
+        "-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "18",
+        "-an",
+        str(dst),
+    ]
+    rc = subprocess.call(cmd_nvenc, creationflags=_NO_WINDOW)
+    if rc == 0 and dst.is_file() and dst.stat().st_size > 1024:
+        return
+    log.warning("NVENC slice failed (rc=%d); falling back to libx264", rc)
+    dst.unlink(missing_ok=True)
+    cmd_x264 = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-i", str(src),
+        "-vf", vf,
         "-vsync", "vfr",
         "-c:v", "libx264", "-preset", "fast", "-crf", "16",
         "-an",
         str(dst),
     ]
-    rc = subprocess.call(cmd, creationflags=_NO_WINDOW)
+    rc = subprocess.call(cmd_x264, creationflags=_NO_WINDOW)
     if rc != 0:
         raise RuntimeError(
             f"ffmpeg slice failed (exit {rc}) for frames {start_frame}..{last}"
@@ -1006,15 +1205,55 @@ def main() -> int:
         return 3
 
     ffmpeg = _find_ffmpeg()
+    ffprobe = _find_ffprobe()
+
+    # Stage 0: pre-encode the source into a robust intermediate.
+    # Without this, slow Python consumption of ffmpeg's raw bgr24 pipe
+    # causes ffmpeg to give up after a few thousand to ~18k frames on
+    # certain source videos (we observed this on a real user 27-min
+    # H.264 clip). The intermediate is decoded clean end-to-end by
+    # subsequent ffmpeg subprocesses, eliminating the back-pressure
+    # truncation. All downstream stages -- DeAOT input, ffmpeg crop,
+    # ffmpeg overlay base -- use the intermediate, not the original.
+    if workspace is not None:
+        workspace.mkdir(parents=True, exist_ok=True)
+        intermediate = workspace / "_source_clean.mp4"
+    else:
+        intermediate = video.with_suffix(".clean.mp4")
+    # Re-use the intermediate IF AND ONLY IF it parses end-to-end --
+    # a previous run that crashed mid-encode left a partial file with
+    # no moov atom that fooled the size-only check and caused v4 to
+    # fail with "Invalid data found when processing input".
+    intermediate_ok = False
+    if intermediate.exists() and intermediate.stat().st_size > 1024:
+        # Trust the file only if ffprobe can read its container metadata.
+        if ffprobe:
+            probe = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries",
+                 "stream=width,height", "-of", "csv", str(intermediate)],
+                capture_output=True, text=True, timeout=15,
+                creationflags=_NO_WINDOW,
+            )
+            intermediate_ok = probe.returncode == 0 and "stream" in probe.stdout
+        else:
+            intermediate_ok = True  # best effort if no ffprobe
+    if intermediate_ok:
+        log.info("Re-using existing intermediate %s (%.1f MB)",
+                 intermediate.name, intermediate.stat().st_size / 1e6)
+    else:
+        intermediate.unlink(missing_ok=True)
+        emit_progress("reencode", 0.0, str(video.stat().st_size))
+        _reencode_source_clean(video, intermediate, ffmpeg)
+        emit_progress("reencode", 1.0)
+    decode_source = intermediate
 
     # Stage 1+2: SAM first-frame + DeAOT propagation. SegTracker hard-
     # codes its mask output to <wm_path>/output/<stem>; we relocate
     # the whole thing immediately afterwards so subsequent stages and
     # any leftover files live inside VSR Pro's tree, not in the
     # sibling watermark_remover repo.
-    ffprobe = _find_ffprobe()
     mask_dir, out_root, frame_w, frame_h = _run_sam_and_deaot(
-        video=video, clicks=clicks, aot_model=aot_model,
+        video=decode_source, clicks=clicks, aot_model=aot_model,
         ffmpeg=ffmpeg, ffprobe=ffprobe,
     )
 
@@ -1076,9 +1315,9 @@ def main() -> int:
         crop_out = crop_workspace / "out"
         crop_out.mkdir(exist_ok=True)
 
-        # 4a. crop the video
+        # 4a. crop the cleaned intermediate
         emit_progress("crop", 0.0)
-        _crop_video(video, crop_video, cx, cy, cw, ch, ffmpeg)
+        _crop_video(decode_source, crop_video, cx, cy, cw, ch, ffmpeg)
         # 4b. crop the masks
         _crop_masks(mask_dir, crop_masks, cx, cy, cw, ch)
         emit_progress("crop", 1.0)
@@ -1093,17 +1332,19 @@ def main() -> int:
             ffmpeg=ffmpeg,
         )
         emit_progress("propainter", 1.0)
-        # 6. overlay back onto the original
+        # 6. overlay back onto the cleaned base (cleaned has same length
+        # as original; using cleaned as base avoids re-introducing the
+        # decode quirks we paid to fix in Stage 0).
         emit_progress("overlay", 0.0)
         output.parent.mkdir(parents=True, exist_ok=True)
-        _overlay(video, inpainted_crop, output, cx, cy, ffmpeg)
+        _overlay(decode_source, inpainted_crop, output, cx, cy, ffmpeg)
         emit_progress("overlay", 1.0)
 
     else:
         # No-crop path: ProPainter on the full frame, copy result out.
         emit_progress("propainter", 0.0, f"{frame_w}x{frame_h}")
         inpainted = _run_propainter(
-            video=video,
+            video=decode_source,
             mask_dir=mask_dir,
             output_dir=out_root,
             fp16=fp16,

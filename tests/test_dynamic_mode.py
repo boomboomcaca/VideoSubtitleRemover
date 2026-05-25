@@ -122,6 +122,50 @@ class TestParseProgress(unittest.TestCase):
         self.assertIsNone(_parse_progress("PROGRESS deaot notanumber"))
 
 
+class TestMaskCleanupIdempotent(unittest.TestCase):
+    """Regression: when _clean_segtracker_masks runs a second time on
+    its own output (which is 0/255 binary), the threshold check must
+    NOT compare to literal 1 -- doing so wipes every mask to all-zero
+    and silently destroys hours of DeAOT work. This actually shipped
+    once: a 5-hour 98668-frame DeAOT run was lost. Test prevents it."""
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+            import numpy as np  # noqa: F401
+        except ImportError:
+            self.skipTest("PIL/numpy unavailable")
+        import shutil as _shutil
+        self.tmp = Path(tempfile.mkdtemp(prefix="vsr_idem_test_"))
+        self._addCleanup = lambda: _shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def tearDown(self):
+        self._addCleanup()
+
+    def test_second_pass_does_not_zero_masks(self):
+        from PIL import Image
+        import numpy as np
+        from backend.dynamic._worker import _clean_segtracker_masks
+        mask_dir = self.tmp / "masks"
+        mask_dir.mkdir()
+        # Write a few PRE-CLEANED masks (0 or 255, simulating what the
+        # bug-era cleanup produced)
+        for i in range(5):
+            arr = np.zeros((100, 100), dtype=np.uint8)
+            # A small filled circle as the watermark
+            arr[40:60, 40:60] = 255
+            Image.fromarray(arr).save(mask_dir / f"{i:05d}.png")
+        # Run cleanup -- must NOT zero them out
+        n = _clean_segtracker_masks(mask_dir)
+        self.assertEqual(n, 5)
+        # Sample a frame, confirm pixels survived
+        out = np.array(Image.open(mask_dir / "00002.png"))
+        self.assertGreater((out > 0).sum(), 0,
+            "Cleanup zeroed all pixels -- the 0/255 vs 0/1 bug regressed!")
+        # Specifically expect roughly the original 400 px (20x20 square)
+        self.assertEqual((out > 0).sum(), 400)
+
+
 class TestParseDeaotFrame(unittest.TestCase):
     """Regression: parent must turn SegTracker's plain-stdout
     'processed frame N' chatter into per-frame DeAOT progress updates

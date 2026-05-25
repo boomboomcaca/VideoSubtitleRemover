@@ -5531,6 +5531,8 @@ class VideoSubtitleRemoverApp:
                     video=src, clicks=[(click_xy[0], click_xy[1], 1)],
                     output=out, wm_path=wm_path,
                     auto_crop=True, fp16=True,
+                    subvideo_length=160,
+                    crop_padding=48,
                     progress_callback=_set_progress,
                 )
                 self.root.after(0, lambda: _done(result.output_video))
