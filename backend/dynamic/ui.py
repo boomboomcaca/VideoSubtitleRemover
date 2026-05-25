@@ -37,6 +37,7 @@ from .external_pipeline import (
     resolve_watermark_remover_path,
     run_dynamic_removal,
 )
+from ..processor import _choose_available_output_path
 
 logger = logging.getLogger(__name__)
 
@@ -524,11 +525,21 @@ class DynamicWatermarkWindow(tk.Toplevel):
     def _pick_output(self):
         if self._video_path is None:
             return
+        # Keep this in lockstep with _on_run's auto-default below so the
+        # two entry points agree on (a) the output directory and (b) the
+        # filename suffix. Tk's asksaveasfilename silently falls back to
+        # a system default if initialdir doesn't exist, so ensure the
+        # output/ subdir is present before opening the dialog.
+        out_dir = self._video_path.parent / "output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        default_out = _choose_available_output_path(
+            out_dir / f"{self._video_path.stem}_no_sub.mp4"
+        )
         path = tk.filedialog.asksaveasfilename(
             parent=self,
             title="Save cleaned video",
-            initialdir=str(self._video_path.parent),
-            initialfile=f"{self._video_path.stem}_clean.mp4",
+            initialdir=str(default_out.parent),
+            initialfile=default_out.name,
             defaultextension=".mp4",
             filetypes=[("MP4", "*.mp4")],
         )
@@ -561,7 +572,7 @@ class DynamicWatermarkWindow(tk.Toplevel):
         )
         # Refresh default output path
         self._output_path = None
-        self._output_label.config(text="(auto: alongside source)")
+        self._output_label.config(text="(auto: input_dir/output/)")
 
         # Kick SAM preview on a background thread: spawn the worker
         # (if not already) and feed it the first frame so subsequent
@@ -653,8 +664,14 @@ class DynamicWatermarkWindow(tk.Toplevel):
                              tone="warn")
             return
 
-        out_path = self._output_path or self._video_path.with_name(
-            f"{self._video_path.stem}_clean.mp4"
+        # Hard-code .mp4 here -- the downstream ffmpeg overlay uses
+        # h264_nvenc + aac copy, which is fine in mp4/mov/mkv but
+        # breaks in .avi/.wmv/.flv. Preserving the source suffix
+        # (the previous behaviour) silently produced unplayable
+        # output for those inputs. Mirror _pick_output's dialog
+        # which already forces .mp4 via defaultextension.
+        out_path = self._output_path or _choose_available_output_path(
+            self._video_path.parent / "output" / f"{self._video_path.stem}_no_sub.mp4"
         )
         self._output_path = out_path
 
