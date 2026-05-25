@@ -95,7 +95,7 @@ def main(argv=None) -> int:
 
     # -- Stage 3: mask cleanup (largest-CC by centroid) --
     log.info("=== Stage 3: mask cleanup (in-place) ===")
-    n_masks = worker._clean_segtracker_masks(mask_dir)
+    n_masks, cached_union, n_with_content = worker._clean_segtracker_masks(mask_dir)
     log.info("Cleaned %d mask PNGs", n_masks)
 
     # -- Stage 4: auto-crop decision --
@@ -103,8 +103,11 @@ def main(argv=None) -> int:
     bbox = None
     auto_crop = args.auto_crop
     if auto_crop:
+        # Pass the cached union from cleanup so we skip the rescan.
         bbox = worker._compute_bbox(
             mask_dir, frame_w, frame_h, padding=args.crop_padding,
+            cached_union=cached_union,
+            cached_n_with_content=n_with_content,
         )
         if bbox is None:
             log.warning("Empty mask -- disabling auto-crop")

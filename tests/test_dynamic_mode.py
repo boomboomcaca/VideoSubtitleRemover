@@ -155,9 +155,15 @@ class TestMaskCleanupIdempotent(unittest.TestCase):
             # A small filled circle as the watermark
             arr[40:60, 40:60] = 255
             Image.fromarray(arr).save(mask_dir / f"{i:05d}.png")
-        # Run cleanup -- must NOT zero them out
-        n = _clean_segtracker_masks(mask_dir)
+        # Run cleanup -- must NOT zero them out. Newer signature returns
+        # (count, union_bbox, n_with_content) so cleanup can hand its
+        # bbox to _compute_bbox without a second mask-dir scan.
+        n, union_bbox, n_with_content = _clean_segtracker_masks(mask_dir)
         self.assertEqual(n, 5)
+        self.assertEqual(n_with_content, 5)
+        # Bbox is inclusive (x_min, y_min, x_max, y_max) of the 20x20
+        # square at [40:60, 40:60] -> (40, 40, 59, 59).
+        self.assertEqual(union_bbox, (40, 40, 59, 59))
         # Sample a frame, confirm pixels survived
         out = np.array(Image.open(mask_dir / "00002.png"))
         self.assertGreater((out > 0).sum(), 0,

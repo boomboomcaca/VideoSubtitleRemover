@@ -486,11 +486,39 @@ def _clean_one_mask_worker(args):
                     drift = True
                 binary = kept
 
-    Image.fromarray(binary * 255).save(png_path)
-    return max_obj, drift
+    # Compute the bbox of the final binary mask. The parent aggregates
+    # these into a union bbox during the cleanup pass, eliminating the
+    # need for a second full scan in _compute_bbox -- saves ~10-15 min
+    # of I/O on a 98K-mask video. Returned as inclusive (x_min, y_min,
+    # x_max, y_max) to match _compute_bbox's existing convention; None
+    # signals "this frame has no mask content".
+    if binary.any():
+        ys, xs = np.where(binary)
+        bbox = (int(xs.min()), int(ys.min()),
+                int(xs.max()), int(ys.max()))
+    else:
+        bbox = None
+
+    # Fast path: skip the rewrite when the input PNG is already in the
+    # canonical {0, 255} binary form AND no drift CC was filtered. This
+    # is the common case on resume runs (e.g. dynamic_resume_from_masks)
+    # where a previous pass already cleaned the masks -- avoids re-zlib-
+    # encoding ~100K files for no behavioural change.
+    if not drift and max_obj == 255 and binary.any():
+        # All non-zero pixels must be exactly 255 (no stray palette
+        # indices like {0, 1, 255}); cheaper than np.unique.
+        if int(arr[arr > 0].min()) == 255:
+            return max_obj, drift, bbox
+
+    # compress_level=1 (vs PIL's PNG default of 6) is 2-3x faster on
+    # save; for binary masks the deflate output is nearly identical in
+    # size at either level because long runs of zeros compress trivially.
+    # Pixel values are bit-identical -- ProPainter sees the same masks.
+    Image.fromarray(binary * 255).save(png_path, compress_level=1)
+    return max_obj, drift, bbox
 
 
-def _clean_segtracker_masks(mask_dir: Path) -> int:
+def _clean_segtracker_masks(mask_dir: Path):
     """Sanitise the raw mask sequence SegTracker wrote.
 
     1. Move ``*_new.png`` files (auxiliary "newly discovered object"
@@ -509,7 +537,13 @@ def _clean_segtracker_masks(mask_dir: Path) -> int:
     frame's cleanup is independent given the reference centroid; on a
     98K-mask, 8-core box this drops cleanup from ~60 min to ~7 min.
 
-    Returns the count of remaining mask PNGs after cleanup.
+    Returns ``(count, union_bbox, n_with_content)`` where:
+      * ``count`` -- number of mask PNGs in *mask_dir* after cleanup
+      * ``union_bbox`` -- inclusive ``(x_min, y_min, x_max, y_max)`` of
+        all non-empty masks, or ``None`` if every mask was empty.
+        This is the raw (unpadded, unaligned) union; downstream
+        ``_compute_bbox`` adds padding + alignment.
+      * ``n_with_content`` -- number of frames whose mask was non-empty.
     """
     import numpy as np
     from PIL import Image
@@ -570,7 +604,7 @@ def _clean_segtracker_masks(mask_dir: Path) -> int:
     png_files = sorted(mask_dir.glob("*.png"))
     total = len(png_files)
     if total == 0:
-        return 0
+        return 0, None, 0
 
     # Worker count: cap at 16 to avoid disk-thrash on long videos with
     # tens of thousands of small PNGs. chunksize=64 amortises the
@@ -581,6 +615,8 @@ def _clean_segtracker_masks(mask_dir: Path) -> int:
     rewritten = 0
     max_obj_seen = 0
     drift_frames = 0
+    n_with_content = 0
+    union_bbox = None  # inclusive (x_min, y_min, x_max, y_max)
     # ~100 progress emissions across the whole run so the UI bar moves
     # smoothly without spamming PROGRESS lines.
     emit_step = max(1, total // 100)
@@ -589,12 +625,23 @@ def _clean_segtracker_masks(mask_dir: Path) -> int:
              total, n_workers, backend)
 
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        for max_obj, drift in executor.map(
+        for max_obj, drift, frame_bbox in executor.map(
                 _clean_one_mask_worker, args_iter, chunksize=64):
             max_obj_seen = max(max_obj_seen, max_obj)
             if drift:
                 drift_frames += 1
             rewritten += 1
+            if frame_bbox is not None:
+                n_with_content += 1
+                if union_bbox is None:
+                    union_bbox = frame_bbox
+                else:
+                    union_bbox = (
+                        min(union_bbox[0], frame_bbox[0]),
+                        min(union_bbox[1], frame_bbox[1]),
+                        max(union_bbox[2], frame_bbox[2]),
+                        max(union_bbox[3], frame_bbox[3]),
+                    )
             if (rewritten % emit_step) == 0 or rewritten == total:
                 emit_progress("mask_cleanup", rewritten / total,
                               f"{rewritten}/{total}")
@@ -602,10 +649,12 @@ def _clean_segtracker_masks(mask_dir: Path) -> int:
     log.info(
         "Rewrote %d mask PNGs to object-1-only binary; "
         "discarded DeAOT-drift artifacts in %d frame(s) "
-        "(max tracked id observed across video: %d)",
+        "(max tracked id observed across video: %d); "
+        "%d/%d frames had non-empty mask",
         rewritten, drift_frames, max_obj_seen,
+        n_with_content, rewritten,
     )
-    return rewritten
+    return rewritten, union_bbox, n_with_content
 
 
 def _compute_bbox(
@@ -614,6 +663,8 @@ def _compute_bbox(
     frame_h: int,
     padding: int,
     align: int = 8,
+    cached_union: Optional[Tuple[int, int, int, int]] = None,
+    cached_n_with_content: Optional[int] = None,
 ) -> Optional[Tuple[int, int, int, int]]:
     """Compute the union bounding box of all nonzero pixels in *mask_dir*.
 
@@ -623,28 +674,42 @@ def _compute_bbox(
     crop avoids a one-pixel resize artifact at the overlay boundary).
 
     Returns None if every mask is empty (no work to do).
+
+    When *cached_union* is supplied (the inclusive ``(x_min, y_min,
+    x_max, y_max)`` produced by the cleanup pass), the full mask-dir
+    rescan is skipped -- the saved ~10-15 min on a 98K-mask job. Pass
+    ``cached_union=None`` for the legacy behaviour (used by
+    ``dynamic_resume_from_masks.py`` where cleanup didn't run in-process).
     """
     import numpy as np
     from PIL import Image
 
-    min_x = min_y = 10**9
-    max_x = max_y = -1
-    n_with_content = 0
+    if cached_union is not None:
+        min_x, min_y, max_x, max_y = cached_union
+        n_with_content = (
+            cached_n_with_content
+            if cached_n_with_content is not None
+            else -1   # "not measured"; the log line just shows it as such
+        )
+    else:
+        min_x = min_y = 10**9
+        max_x = max_y = -1
+        n_with_content = 0
 
-    for png in sorted(mask_dir.glob("*.png")):
-        arr = np.array(Image.open(png))
-        ys, xs = np.where(arr > 0)
-        if xs.size == 0:
-            continue
-        n_with_content += 1
-        min_x = min(min_x, int(xs.min()))
-        max_x = max(max_x, int(xs.max()))
-        min_y = min(min_y, int(ys.min()))
-        max_y = max(max_y, int(ys.max()))
+        for png in sorted(mask_dir.glob("*.png")):
+            arr = np.array(Image.open(png))
+            ys, xs = np.where(arr > 0)
+            if xs.size == 0:
+                continue
+            n_with_content += 1
+            min_x = min(min_x, int(xs.min()))
+            max_x = max(max_x, int(xs.max()))
+            min_y = min(min_y, int(ys.min()))
+            max_y = max(max_y, int(ys.max()))
 
-    if n_with_content == 0:
-        log.warning("Every mask is empty; nothing to inpaint.")
-        return None
+        if n_with_content == 0:
+            log.warning("Every mask is empty; nothing to inpaint.")
+            return None
 
     # Pad
     x0 = max(0, min_x - padding)
@@ -665,10 +730,10 @@ def _compute_bbox(
 
     log.info(
         "Mask bbox: union=(%d,%d)-(%d,%d), padded+aligned=%dx%d at (%d,%d) "
-        "[%.1f%% of frame area, %d of %d frames had mask content]",
+        "[%.1f%% of frame area, %s frame(s) had mask content]",
         min_x, min_y, max_x, max_y, w_aligned, h_aligned, x0, y0,
         100 * w_aligned * h_aligned / (frame_w * frame_h),
-        n_with_content, len(list(mask_dir.glob("*.png"))),
+        "?" if n_with_content < 0 else str(n_with_content),
     )
     return x0, y0, w_aligned, h_aligned
 
@@ -682,8 +747,11 @@ def _crop_video(
     libx264 fallback if NVENC fails (e.g. driver issue / no NVIDIA GPU).
     """
     log.info("ffmpeg crop -> %s (%dx%d at %d,%d)", dst.name, w, h, x, y)
+    # `-hwaccel cuda` enables NVDEC; ffmpeg silently falls back to software
+    # decode for codecs CUDA can't handle, so adding this is safe.
     cmd_nvenc = [
         ffmpeg, "-y", "-loglevel", "error",
+        "-hwaccel", "cuda",
         "-i", str(src),
         "-vf", f"crop={w}:{h}:{x}:{y}",
         "-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "18",
@@ -708,17 +776,45 @@ def _crop_video(
         raise RuntimeError(f"ffmpeg crop failed (exit {rc})")
 
 
+def _crop_one_mask_worker(args):
+    """Per-frame mask crop; runs inside a ProcessPoolExecutor child.
+
+    Module-level so it pickles cleanly across processes on Windows.
+    """
+    src, dst, x, y, w, h = args
+    from PIL import Image
+    img = Image.open(src).crop((x, y, x + w, y + h))
+    # compress_level=1 mirrors _clean_one_mask_worker -- bit-identical
+    # pixel data, ~2-3x faster save on binary masks.
+    img.save(dst, compress_level=1)
+
+
 def _crop_masks(
     src_dir: Path, dst_dir: Path, x: int, y: int, w: int, h: int,
 ) -> int:
-    """Crop every PNG mask in *src_dir* and write to *dst_dir*."""
-    from PIL import Image
+    """Crop every PNG mask in *src_dir* and write to *dst_dir*.
+
+    Parallelised across CPU cores -- a 98K-mask job drops from ~10 min
+    serial to ~1-2 min on an 8-core box.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+
     dst_dir.mkdir(parents=True, exist_ok=True)
+    pngs = sorted(src_dir.glob("*.png"))
+    total = len(pngs)
+    if total == 0:
+        return 0
+
+    args_iter = [
+        (str(p), str(dst_dir / p.name), x, y, w, h) for p in pngs
+    ]
+    n_workers = max(2, min(16, (os.cpu_count() or 4)))
+
     n = 0
-    for png in sorted(src_dir.glob("*.png")):
-        img = Image.open(png).crop((x, y, x + w, y + h))
-        img.save(dst_dir / png.name)
-        n += 1
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        # consume() the iterator -- map raises if any worker raised.
+        for _ in executor.map(_crop_one_mask_worker, args_iter, chunksize=64):
+            n += 1
     log.info("Cropped %d masks -> %s", n, dst_dir)
     return n
 
@@ -885,9 +981,12 @@ def _reencode_source_clean(
     so user-perceived quality matches the intermediate.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
-    # NVENC first
+    # NVENC encode + NVDEC decode (`-hwaccel cuda`). The decode side falls
+    # back to CPU automatically for codecs CUDA doesn't support, so adding
+    # the flag is safe even on inputs that aren't H.264.
     cmd_nvenc = [
         ffmpeg, "-y", "-loglevel", "error",
+        "-hwaccel", "cuda",
         "-err_detect", "ignore_err",
         "-fflags", "+discardcorrupt",
         "-i", str(src),
@@ -1375,9 +1474,11 @@ def main() -> int:
         mask_dir = out_root / mask_dir.name
         log.info("Relocated DeAOT outputs -> %s", out_root)
 
-    # Stage 3: mask sanity pass
+    # Stage 3: mask sanity pass. The cleanup pass now also returns the
+    # raw union bbox + count of non-empty frames, so Stage 4 can skip
+    # its full mask-dir rescan -- saving ~10-15 min on a 98K-mask video.
     emit_progress("mask_cleanup", 0.0)
-    n_masks = _clean_segtracker_masks(mask_dir)
+    n_masks, cached_union, n_with_content = _clean_segtracker_masks(mask_dir)
     log.info("Cleaned mask directory: %d PNGs ready for ProPainter", n_masks)
     emit_progress("mask_cleanup", 1.0, str(n_masks))
 
@@ -1385,12 +1486,21 @@ def main() -> int:
     bbox = None
     if auto_crop:
         emit_progress("bbox", 0.0)
-        bbox = _compute_bbox(mask_dir, frame_w, frame_h, padding=crop_padding)
-        if bbox is None:
+        if cached_union is None:
+            # Every frame was empty -- mirror legacy _compute_bbox warning.
             log.warning("Disabling auto-crop because mask is empty.")
             auto_crop = False
         else:
-            emit_progress("bbox", 1.0, f"{bbox[2]}x{bbox[3]}")
+            bbox = _compute_bbox(
+                mask_dir, frame_w, frame_h, padding=crop_padding,
+                cached_union=cached_union,
+                cached_n_with_content=n_with_content,
+            )
+            if bbox is None:
+                log.warning("Disabling auto-crop because mask is empty.")
+                auto_crop = False
+            else:
+                emit_progress("bbox", 1.0, f"{bbox[2]}x{bbox[3]}")
 
     if auto_crop and bbox is not None:
         cx, cy, cw, ch = bbox
