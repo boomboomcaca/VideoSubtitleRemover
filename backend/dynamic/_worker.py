@@ -924,11 +924,19 @@ def _overlay(
 # whole sequence) so even with auto-crop a long video OOMs immediately.
 # 800 frames at ~400x400 fp16 fits comfortably on a 12 GB consumer GPU
 # (empirically we ran 596 frames at 224x224 with VRAM headroom). When
-# the clip is longer we slice with ffmpeg, ProPainter each slice
-# independently, then concat the inpainted slices back. Boundaries are
-# visible only if the watermark drifts dramatically inside a single
-# slice -- for typical fixed-position logos the seams are invisible.
+# the clip is longer we slice with ffmpeg, ProPainter each PADDED slice
+# independently, then concat the (un-padded) inpainted slices back. See
+# PROPAINTER_CHUNK_PAD for why padding is mandatory: without it every
+# chunk boundary is a visible colour/lighting seam.
 PROPAINTER_CHUNK_FRAMES = 800
+# Frames of overlap on EACH side between adjacent chunks. The padded
+# frames are fed to ProPainter purely as temporal context and discarded
+# before concat -- without this, every PROPAINTER_CHUNK_FRAMES boundary
+# was a visible seam (colour/lighting jump) because ProPainter has no
+# temporal context that crosses chunk boundaries. 80 frames at 24fps is
+# ~3.3 sec of context; smaller risks the seam reappearing, larger costs
+# more compute (~ 2*pad/chunk_frames extra GPU time per middle chunk).
+PROPAINTER_CHUNK_PAD = 80
 
 
 def _run_propainter(
@@ -1122,6 +1130,107 @@ def _ffmpeg_slice_video(
         )
 
 
+def _compute_chunk_geometry(
+    total_frames: int, chunk_frames: int, pad: int,
+) -> list:
+    """Plan padded ProPainter chunks.
+
+    Returns a list of ``(chunk_start, chunk_n, keep_offset, keep_n)`` tuples
+    describing how to slice a *total_frames*-long sequence into
+    overlapping ProPainter chunks, where:
+
+    - ``[chunk_start, chunk_start + chunk_n)`` is the frame range to
+      feed ProPainter (with up to *pad* padding frames on each side, used
+      purely as temporal context).
+    - ``[chunk_start + keep_offset, chunk_start + keep_offset + keep_n)``
+      is the slice of the inpainted output that should be retained;
+      the rest is padding to be discarded by the caller before concat.
+
+    The keep ranges of consecutive tuples are exactly contiguous and
+    together cover ``[0, total_frames)`` with no gaps and no overlap, so
+    concatenating the kept slices reproduces the full video length.
+
+    Edge cases:
+    - First chunk has ``keep_offset == 0`` (no left pad to discard).
+    - Last chunk has ``keep_n == total_frames - keep_start`` and no
+      right padding to discard.
+    - If ``total_frames <= chunk_frames``, returns a single tuple with
+      no padding (single-shot, fully covered by ProPainter's own
+      subvideo windowing -- no seams to fix).
+    """
+    if total_frames <= 0:
+        return []
+    if chunk_frames <= 0:
+        raise ValueError(f"chunk_frames must be positive, got {chunk_frames}")
+    if pad < 0:
+        raise ValueError(f"pad must be non-negative, got {pad}")
+
+    n_chunks = (total_frames + chunk_frames - 1) // chunk_frames
+    if n_chunks == 1:
+        return [(0, total_frames, 0, total_frames)]
+
+    plan = []
+    for idx in range(n_chunks):
+        keep_start = idx * chunk_frames
+        keep_end = min(total_frames, keep_start + chunk_frames)
+
+        pad_left = min(keep_start, pad)             # 0 for first chunk
+        pad_right = min(total_frames - keep_end, pad)  # 0 for last chunk
+
+        chunk_start = keep_start - pad_left
+        chunk_end = keep_end + pad_right
+        chunk_n = chunk_end - chunk_start
+        keep_offset = pad_left
+        keep_n = keep_end - keep_start
+
+        plan.append((chunk_start, chunk_n, keep_offset, keep_n))
+    return plan
+
+
+def _ffmpeg_trim_frames(
+    src: Path, dst: Path, start_idx: int, n_frames: int, ffmpeg: str,
+) -> None:
+    """Re-encode *src* keeping only ``[start_idx, start_idx + n_frames)``.
+
+    Used to drop the context-padding frames from a ProPainter chunk
+    before concat. Uses NVENC for speed with libx264 fallback. Stream
+    copy with ``-ss`` is unsafe here because we need exact frame-level
+    alignment between adjacent chunks; a single re-encode at CQ 18 is
+    visually transparent.
+    """
+    last = start_idx + n_frames - 1
+    vf = (f"select=between(n\\,{start_idx}\\,{last}),"
+          f"setpts=PTS-STARTPTS")
+    cmd_nvenc = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-i", str(src),
+        "-vf", vf,
+        "-vsync", "vfr",
+        "-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "18",
+        "-an",
+        str(dst),
+    ]
+    rc = subprocess.call(cmd_nvenc, creationflags=_NO_WINDOW)
+    if rc == 0 and dst.is_file() and dst.stat().st_size > 1024:
+        return
+    log.warning("NVENC trim failed (rc=%d); falling back to libx264", rc)
+    dst.unlink(missing_ok=True)
+    cmd_x264 = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-i", str(src),
+        "-vf", vf,
+        "-vsync", "vfr",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+        "-an",
+        str(dst),
+    ]
+    rc = subprocess.call(cmd_x264, creationflags=_NO_WINDOW)
+    if rc != 0:
+        raise RuntimeError(
+            f"ffmpeg trim failed (exit {rc}) for frames {start_idx}..{last}"
+        )
+
+
 def _ffmpeg_concat(parts: list, dst: Path, ffmpeg: str) -> None:
     """Concatenate *parts* into *dst* losslessly with the concat demuxer."""
     list_file = dst.parent / "_concat.txt"
@@ -1154,21 +1263,34 @@ def _run_propainter_chunked(
     ffmpeg: str,
     chunk_frames: int,
     total_frames: int,
+    pad: int = PROPAINTER_CHUNK_PAD,
 ) -> Path:
-    """Slice -> ProPainter each chunk -> ffmpeg concat the outputs."""
+    """Slice -> ProPainter each chunk (with context padding) -> trim ->
+    ffmpeg concat the trimmed outputs.
+
+    Each chunk is fed to ProPainter with up to *pad* extra frames on
+    each side as temporal context. The padded frames are then dropped
+    via ffmpeg before concat so the seam between chunks lands inside a
+    region both neighbours saw, eliminating the colour/lighting jumps
+    that were visible at every chunk boundary in the un-padded version.
+
+    Per-chunk overhead vs un-padded: ``2 * pad / chunk_frames`` (e.g.
+    ~20% at pad=80 / chunk_frames=800 for the middle chunks; first and
+    last chunks have only single-side padding).
+    """
+    import json as _json
     import shutil as _shutil
 
     chunks_dir = output_dir / "_chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
-    n_chunks = (total_frames + chunk_frames - 1) // chunk_frames
+
+    plan = _compute_chunk_geometry(total_frames, chunk_frames, pad)
+    n_chunks = len(plan)
     chunk_outputs = []
 
     n_skipped = 0
-    for idx in range(n_chunks):
-        start = idx * chunk_frames
-        n = min(chunk_frames, total_frames - start)
-        last = start + n - 1
-        emit_progress("propainter", (idx) / n_chunks,
+    for idx, (chunk_start, chunk_n, keep_offset, keep_n) in enumerate(plan):
+        emit_progress("propainter", idx / max(n_chunks, 1),
                       f"chunk_{idx + 1}/{n_chunks}")
 
         cdir = chunks_dir / f"c{idx:04d}"
@@ -1176,49 +1298,89 @@ def _run_propainter_chunked(
         cvideo = cdir / "in.mp4"
         cmask = cdir / "masks"
         cout = cdir / "out"
+        trimmed = cdir / "trimmed.mp4"
+        geom_path = cdir / "geometry.json"
+        expected_geom = {
+            "version": 2,
+            "chunk_start": chunk_start,
+            "chunk_n": chunk_n,
+            "keep_offset": keep_offset,
+            "keep_n": keep_n,
+            "pad": pad,
+        }
 
-        # Resume: ProPainter writes to ``<cout>/<cvideo.stem>/inpaint_out.mp4``
-        # (i.e. <cout>/in/inpaint_out.mp4 since the slice is named in.mp4).
-        # If a prior run produced this file at a reasonable size, the
-        # chunk is already done -- skip slice + mask copy + inference,
-        # which is by far the longest stage in the pipeline.
-        existing = cout / cvideo.stem / "inpaint_out.mp4"
-        if existing.is_file() and existing.stat().st_size > 1024:
-            log.info(
-                "Chunk %d/%d: frames %d..%d -- REUSING existing output "
-                "(%.1f MB)",
-                idx + 1, n_chunks, start, last,
-                existing.stat().st_size / 1e6,
-            )
-            chunk_outputs.append(existing)
-            n_skipped += 1
-            continue
+        # Resume: only reuse if BOTH the trimmed mp4 exists AND the
+        # sidecar geometry exactly matches what we'd produce now. This
+        # invalidates any chunks computed by an older code path (no
+        # padding, or different pad value), since they have either no
+        # trimmed.mp4 or a mismatching geometry.json.
+        if trimmed.is_file() and trimmed.stat().st_size > 1024 \
+                and geom_path.is_file():
+            try:
+                with open(geom_path, "r", encoding="utf-8") as fh:
+                    cached = _json.load(fh)
+            except Exception:  # noqa: BLE001
+                cached = None
+            if cached == expected_geom:
+                log.info(
+                    "Chunk %d/%d: frames %d..%d (keep %d) -- REUSING "
+                    "trimmed output (%.1f MB)",
+                    idx + 1, n_chunks, chunk_start, chunk_start + chunk_n - 1,
+                    keep_n, trimmed.stat().st_size / 1e6,
+                )
+                chunk_outputs.append(trimmed)
+                n_skipped += 1
+                continue
+            else:
+                log.info(
+                    "Chunk %d/%d: geometry mismatch (cached=%r, expected=%r)"
+                    " -- recomputing",
+                    idx + 1, n_chunks, cached, expected_geom,
+                )
 
-        log.info("Chunk %d/%d: frames %d..%d (%d frames)",
-                 idx + 1, n_chunks, start, last, n)
+        log.info(
+            "Chunk %d/%d: feeding ProPainter frames %d..%d "
+            "(%d frames, keep %d offset %d)",
+            idx + 1, n_chunks,
+            chunk_start, chunk_start + chunk_n - 1,
+            chunk_n, keep_n, keep_offset,
+        )
 
         cmask.mkdir(exist_ok=True)
         cout.mkdir(exist_ok=True)
 
-        # ffmpeg slice the source video to this chunk's frame range
-        _ffmpeg_slice_video(video, cvideo, start, n, ffmpeg)
+        # ffmpeg slice the source video to this chunk's PADDED frame range
+        _ffmpeg_slice_video(video, cvideo, chunk_start, chunk_n, ffmpeg)
 
         # Copy the matching mask subset (renamed to start from 00000)
-        for i in range(start, start + n):
+        for i in range(chunk_start, chunk_start + chunk_n):
             src_mask = mask_dir / f"{i:05d}.png"
             if not src_mask.is_file():
                 raise FileNotFoundError(
                     f"Expected mask missing: {src_mask}"
                 )
-            dst_mask = cmask / f"{i - start:05d}.png"
+            dst_mask = cmask / f"{i - chunk_start:05d}.png"
             _shutil.copy(src_mask, dst_mask)
 
-        # ProPainter on this chunk -- single-shot since it's now small
+        # ProPainter on the padded slice -- single-shot since it's small
         produced = _run_propainter_single(
             cvideo, cmask, cout,
             fp16=fp16, subvideo_length=subvideo_length,
         )
-        chunk_outputs.append(produced)
+
+        # Trim the padding off so concat boundaries land in the region
+        # both neighbours saw (no seam). For first/last chunks with no
+        # padding to drop, skip the re-encode and use the raw output.
+        if keep_offset == 0 and keep_n == chunk_n:
+            _shutil.copy(produced, trimmed)
+        else:
+            _ffmpeg_trim_frames(produced, trimmed, keep_offset, keep_n,
+                                ffmpeg)
+
+        with open(geom_path, "w", encoding="utf-8") as fh:
+            _json.dump(expected_geom, fh)
+
+        chunk_outputs.append(trimmed)
 
     if n_skipped:
         log.info("ProPainter resume: reused %d/%d existing chunk outputs",

@@ -295,14 +295,26 @@ class TestWorkspaceModule(unittest.TestCase):
             (crop_masks / f"{i:05d}.png").write_bytes(b"\0" * 256)
         chunks = crop_dir / "out" / "_chunks"
         for i in range(2):
-            c = chunks / f"c{i:04d}" / "out" / "in"
-            c.mkdir(parents=True)
-            (c / "inpaint_out.mp4").write_bytes(b"\0" * 8192)
-        # An incomplete chunk -- a tiny file that the resume threshold
-        # should NOT count as done.
-        c_partial = chunks / "c0002" / "out" / "in"
+            cdir = chunks / f"c{i:04d}"
+            cdir.mkdir(parents=True)
+            # New schema: trimmed.mp4 + geometry.json sidecar
+            (cdir / "trimmed.mp4").write_bytes(b"\0" * 8192)
+            (cdir / "geometry.json").write_text(
+                '{"version": 2, "chunk_start": 0, "chunk_n": 880,'
+                ' "keep_offset": 0, "keep_n": 800, "pad": 80}',
+                encoding="utf-8",
+            )
+        # An incomplete chunk -- a tiny file the size check should reject.
+        c_partial = chunks / "c0002"
         c_partial.mkdir(parents=True)
-        (c_partial / "inpaint_out.mp4").write_bytes(b"\0" * 100)
+        (c_partial / "trimmed.mp4").write_bytes(b"\0" * 100)
+        (c_partial / "geometry.json").write_text("{}", encoding="utf-8")
+        # An OLD-schema chunk (inpaint_out.mp4 only, no trimmed/geometry).
+        # Must NOT count as done -- old chunks are un-padded and produce
+        # visible seams; the next run is supposed to recompute them.
+        c_old = chunks / "c0003" / "out" / "in"
+        c_old.mkdir(parents=True)
+        (c_old / "inpaint_out.mp4").write_bytes(b"\0" * 8192)
         return ws
 
     def test_describe_empty(self):
@@ -394,6 +406,125 @@ class TestWorkspaceModule(unittest.TestCase):
         self.assertEqual(format_size(2048), "2.0 KB")
         self.assertEqual(format_size(2 * 1024 * 1024), "2.0 MB")
         self.assertEqual(format_size(int(3.2 * 1024 ** 3)), "3.2 GB")
+
+
+class TestChunkGeometry(unittest.TestCase):
+    """Planner for padded ProPainter chunks. Bugs here either leave
+    visible seams (under-pad, gaps in coverage) or silently truncate /
+    duplicate frames (overlapping or non-contiguous keep ranges), both
+    of which are user-visible quality regressions, so the math wants
+    exhaustive coverage."""
+
+    def _validate_plan(self, plan, total_frames):
+        """Common invariants every valid plan must satisfy."""
+        # Concatenated keep ranges exactly cover [0, total_frames).
+        cursor = 0
+        for chunk_start, chunk_n, keep_offset, keep_n in plan:
+            self.assertGreaterEqual(chunk_start, 0)
+            self.assertGreater(chunk_n, 0)
+            self.assertGreaterEqual(keep_offset, 0)
+            self.assertGreater(keep_n, 0)
+            self.assertLessEqual(keep_offset + keep_n, chunk_n)
+            self.assertEqual(chunk_start + keep_offset, cursor,
+                             f"keep range gap/overlap at cursor={cursor}, "
+                             f"chunk={chunk_start}+{keep_offset}")
+            cursor += keep_n
+        self.assertEqual(cursor, total_frames,
+                         f"keep ranges cover {cursor}, expected {total_frames}")
+
+    def test_single_chunk_no_padding(self):
+        # Small video fits in one chunk; no padding needed (no seams).
+        from backend.dynamic._worker import _compute_chunk_geometry
+        plan = _compute_chunk_geometry(500, chunk_frames=800, pad=80)
+        self.assertEqual(plan, [(0, 500, 0, 500)])
+
+    def test_exactly_chunk_size_single_shot(self):
+        from backend.dynamic._worker import _compute_chunk_geometry
+        plan = _compute_chunk_geometry(800, chunk_frames=800, pad=80)
+        self.assertEqual(plan, [(0, 800, 0, 800)])
+
+    def test_two_chunks_first_no_left_pad_last_no_right_pad(self):
+        from backend.dynamic._worker import _compute_chunk_geometry
+        plan = _compute_chunk_geometry(1600, chunk_frames=800, pad=80)
+        self.assertEqual(len(plan), 2)
+        # Chunk 0: covers [0, 880), keeps [0, 800) (no left pad)
+        self.assertEqual(plan[0], (0, 880, 0, 800))
+        # Chunk 1: covers [720, 1600), keeps [800, 1600) (no right pad)
+        self.assertEqual(plan[1], (720, 880, 80, 800))
+        self._validate_plan(plan, 1600)
+
+    def test_three_chunks_middle_has_symmetric_pad(self):
+        from backend.dynamic._worker import _compute_chunk_geometry
+        plan = _compute_chunk_geometry(2400, chunk_frames=800, pad=80)
+        self.assertEqual(len(plan), 3)
+        self.assertEqual(plan[0], (0, 880, 0, 800))         # no left pad
+        self.assertEqual(plan[1], (720, 960, 80, 800))      # both sides
+        self.assertEqual(plan[2], (1520, 880, 80, 800))     # no right pad
+        self._validate_plan(plan, 2400)
+
+    def test_user_98668_frames_124_chunks(self):
+        # Reproduces the real Diablo-4 case: 98668 frames / chunk_frames=800
+        # = 124 chunks (last chunk is partial: 98668 - 123*800 = 268 frames).
+        from backend.dynamic._worker import _compute_chunk_geometry
+        plan = _compute_chunk_geometry(98668, chunk_frames=800, pad=80)
+        self.assertEqual(len(plan), 124)
+        # First: [0, 880), keep [0, 800)
+        self.assertEqual(plan[0], (0, 880, 0, 800))
+        # Middle (e.g. 50): [50*800-80, 51*800+80) = [39920, 40880), keep 800
+        self.assertEqual(plan[50], (39920, 960, 80, 800))
+        # Last (idx=123): keep_start=98400, keep_n=268, no right pad
+        self.assertEqual(plan[123], (98320, 348, 80, 268))
+        self._validate_plan(plan, 98668)
+
+    def test_uneven_last_chunk_keeps_full_remainder(self):
+        from backend.dynamic._worker import _compute_chunk_geometry
+        # 1500 frames into 800-chunks => 800 + 700 split
+        plan = _compute_chunk_geometry(1500, chunk_frames=800, pad=80)
+        self.assertEqual(len(plan), 2)
+        self.assertEqual(plan[0], (0, 880, 0, 800))
+        # Chunk 1: keep_start=800, keep_n=700, left pad=80, no right pad
+        self.assertEqual(plan[1], (720, 780, 80, 700))
+        self._validate_plan(plan, 1500)
+
+    def test_pad_zero_falls_back_to_unpadded(self):
+        # Setting pad=0 must reproduce the legacy un-padded behaviour
+        # exactly -- escape hatch if NVENC trim ever becomes a bottleneck.
+        from backend.dynamic._worker import _compute_chunk_geometry
+        plan = _compute_chunk_geometry(2000, chunk_frames=800, pad=0)
+        self.assertEqual(plan, [
+            (0,    800, 0, 800),
+            (800,  800, 0, 800),
+            (1600, 400, 0, 400),
+        ])
+        self._validate_plan(plan, 2000)
+
+    def test_pad_larger_than_first_chunk_offset_clipped(self):
+        # If pad > chunk_frames it would create double-counted context;
+        # the clip-to-video-bounds logic still has to keep the plan
+        # internally consistent.
+        from backend.dynamic._worker import _compute_chunk_geometry
+        plan = _compute_chunk_geometry(2000, chunk_frames=800, pad=200)
+        # Chunk 0: keep_start=0 -> left pad clipped to 0
+        self.assertEqual(plan[0][0], 0)
+        # Chunk 2 (last): right pad clipped to 0 (no frames beyond keep_end)
+        self.assertEqual(plan[2][0] + plan[2][1], 2000)
+        self._validate_plan(plan, 2000)
+
+    def test_empty_video_returns_empty_plan(self):
+        from backend.dynamic._worker import _compute_chunk_geometry
+        self.assertEqual(_compute_chunk_geometry(0, 800, 80), [])
+
+    def test_invalid_chunk_frames_rejected(self):
+        from backend.dynamic._worker import _compute_chunk_geometry
+        with self.assertRaises(ValueError):
+            _compute_chunk_geometry(1000, chunk_frames=0, pad=80)
+        with self.assertRaises(ValueError):
+            _compute_chunk_geometry(1000, chunk_frames=-100, pad=80)
+
+    def test_invalid_pad_rejected(self):
+        from backend.dynamic._worker import _compute_chunk_geometry
+        with self.assertRaises(ValueError):
+            _compute_chunk_geometry(1000, chunk_frames=800, pad=-1)
 
 
 class TestResumeThreshold(unittest.TestCase):

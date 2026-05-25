@@ -125,14 +125,21 @@ def describe_workspace(ws: Path) -> WorkspaceState:
     n_crop_masks = (sum(1 for _ in crop_masks.glob("*.png"))
                     if crop_masks.is_dir() else 0)
 
+    # A chunk counts as "done" only when it has a trimmed.mp4 produced
+    # by the current padded pipeline AND its geometry sidecar. Old chunks
+    # with just inpaint_out.mp4 (un-padded, visible seams) deliberately
+    # don't qualify -- the next run will recompute them with proper
+    # cross-boundary context.
     n_chunks_done = 0
     if chunks_dir.is_dir():
         for c in chunks_dir.iterdir():
             if not c.is_dir():
                 continue
-            out_mp4 = c / "out" / "in" / "inpaint_out.mp4"
+            trimmed = c / "trimmed.mp4"
+            geom = c / "geometry.json"
             try:
-                if out_mp4.is_file() and out_mp4.stat().st_size > 1024:
+                if (trimmed.is_file() and trimmed.stat().st_size > 1024
+                        and geom.is_file()):
                     n_chunks_done += 1
             except OSError:
                 pass
