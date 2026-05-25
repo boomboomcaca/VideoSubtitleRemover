@@ -5500,23 +5500,41 @@ class VideoSubtitleRemoverApp:
         prog_win = tk.Toplevel(self.root)
         prog_win.title("Removing watermark...")
         prog_win.configure(bg=Theme.BG_OVERLAY)
-        prog_win.geometry("520x180")
         prog_win.transient(self.root)
+        prog_win.resizable(True, True)
+
+        # Pack the button row FIRST with side='bottom' so it always
+        # claims its strip at the bottom of the window, regardless of
+        # how much vertical space the status label + progress bar end
+        # up needing on high-DPI displays. Earlier ordering (content
+        # first) could push the Hide button right-justified-but-clipped
+        # against the window edge.
+        btn_row = tk.Frame(prog_win, bg=Theme.BG_OVERLAY)
+        btn_row.pack(side="bottom", fill="x",
+                     padx=Theme.S_LG, pady=(Theme.S_SM, Theme.S_LG))
+
+        # Content frame fills the rest above the buttons.
+        body = tk.Frame(prog_win, bg=Theme.BG_OVERLAY)
+        body.pack(side="top", fill="both", expand=True)
+
+        # Source filename can be 70+ chars on real-world inputs; collapse
+        # the middle so it stays on a single line without overflowing.
         tk.Label(
-            prog_win, text=f"Source: {src.name}",
+            body, text=f"Source: {truncate_middle(src.name, 60)}",
             font=f(Theme.F_BODY, "bold"),
             bg=Theme.BG_OVERLAY, fg=Theme.TEXT_PRIMARY,
             anchor="w",
         ).pack(fill="x", padx=Theme.S_LG, pady=(Theme.S_LG, Theme.S_XS))
         status_lbl = tk.Label(
-            prog_win, text="Starting...",
+            body, text="Starting...",
             font=f(Theme.F_META),
             bg=Theme.BG_OVERLAY, fg=Theme.TEXT_SECONDARY,
-            anchor="w", justify="left", wraplength=480,
+            anchor="w", justify="left",
+            wraplength=_scaled(self.root, 520),
         )
         status_lbl.pack(fill="x", padx=Theme.S_LG)
 
-        bar_canvas = tk.Canvas(prog_win, bg=Theme.BG_TERTIARY,
+        bar_canvas = tk.Canvas(body, bg=Theme.BG_TERTIARY,
                                height=10, highlightthickness=0)
         bar_canvas.pack(fill="x", padx=Theme.S_LG, pady=Theme.S_SM)
         bar_id = bar_canvas.create_rectangle(
@@ -5594,14 +5612,27 @@ class VideoSubtitleRemoverApp:
             _sp.Popen(["explorer", "/select,", str(path)])
             prog_win.destroy()
 
-        btn_row = tk.Frame(prog_win, bg=Theme.BG_OVERLAY)
-        btn_row.pack(fill="x", padx=Theme.S_LG, pady=(Theme.S_SM, Theme.S_LG))
         close_btn = ModernButton(
             btn_row, text="Hide", command=prog_win.destroy,
             style="secondary", size="sm", width=120,
         )
         close_btn.pack(side="right")
         close_btn_var["btn"] = close_btn
+
+        # Now that everything is laid out, let Tk compute the required
+        # size and centre on the parent. Pin a minimum width so a short
+        # filename doesn't produce a tiny dialog.
+        prog_win.update_idletasks()
+        req_w = max(prog_win.winfo_reqwidth(), _scaled(self.root, 560))
+        req_h = max(prog_win.winfo_reqheight(), _scaled(self.root, 180))
+        try:
+            px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
+            pw, ph = self.root.winfo_width(), self.root.winfo_height()
+            x = px + max(0, (pw - req_w) // 2)
+            y = py + max(0, (ph - req_h) // 3)
+            prog_win.geometry(f"{req_w}x{req_h}+{x}+{y}")
+        except Exception:  # noqa: BLE001
+            prog_win.geometry(f"{req_w}x{req_h}")
 
         threading.Thread(target=_bg, daemon=True).start()
 
