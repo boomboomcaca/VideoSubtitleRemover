@@ -545,9 +545,40 @@ def _clean_segtracker_masks(mask_dir: Path):
         ``_compute_bbox`` adds padding + alignment.
       * ``n_with_content`` -- number of frames whose mask was non-empty.
     """
+    import json
     import numpy as np
     from PIL import Image
     from concurrent.futures import ProcessPoolExecutor
+
+    # Sidecar fast-path: a previous successful cleanup writes a tiny
+    # JSON summary next to the mask dir; if it's present and the PNG
+    # count still matches, the entire cleanup pass (~5-10 min on a
+    # 98K-mask resume) collapses to a single file read.
+    sidecar = mask_dir.parent / f"{mask_dir.name}_cleanup.json"
+    if sidecar.is_file():
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+            if data.get("schema_version") == 1:
+                cached_n = int(data["n_masks"])
+                current_n = sum(1 for _ in mask_dir.glob("*.png"))
+                if current_n == cached_n and current_n > 0:
+                    bb = data.get("union_bbox")
+                    bb = tuple(bb) if bb is not None else None
+                    nwc = int(data.get("n_with_content", 0))
+                    log.info(
+                        "Cleanup sidecar matches (%d masks); SKIPPING "
+                        "the entire cleanup pass.", cached_n,
+                    )
+                    return cached_n, bb, nwc
+                else:
+                    log.info(
+                        "Cleanup sidecar present but mask count drifted "
+                        "(%d on disk vs %d cached); ignoring sidecar.",
+                        current_n, cached_n,
+                    )
+        except (ValueError, KeyError, OSError) as e:
+            log.warning("Could not read cleanup sidecar %s: %s; ignoring.",
+                        sidecar, e)
 
     aux_masks = list(mask_dir.glob("*_new.png"))
     if aux_masks:
@@ -654,6 +685,24 @@ def _clean_segtracker_masks(mask_dir: Path):
         rewritten, drift_frames, max_obj_seen,
         n_with_content, rewritten,
     )
+
+    # Persist the cleanup summary so a future re-run can short-circuit
+    # straight to crop / ProPainter without rescanning 98K PNGs. Written
+    # atomically (temp file + replace) so a kill mid-write can't leave
+    # a half-formed sidecar that future runs would have to ignore.
+    try:
+        payload = {
+            "schema_version": 1,
+            "n_masks": rewritten,
+            "union_bbox": list(union_bbox) if union_bbox is not None else None,
+            "n_with_content": n_with_content,
+        }
+        tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(sidecar)
+    except OSError as e:
+        log.warning("Failed to write cleanup sidecar %s: %s", sidecar, e)
+
     return rewritten, union_bbox, n_with_content
 
 
@@ -1114,12 +1163,11 @@ def _run_propainter_chunked(
     n_chunks = (total_frames + chunk_frames - 1) // chunk_frames
     chunk_outputs = []
 
+    n_skipped = 0
     for idx in range(n_chunks):
         start = idx * chunk_frames
         n = min(chunk_frames, total_frames - start)
         last = start + n - 1
-        log.info("Chunk %d/%d: frames %d..%d (%d frames)",
-                 idx + 1, n_chunks, start, last, n)
         emit_progress("propainter", (idx) / n_chunks,
                       f"chunk_{idx + 1}/{n_chunks}")
 
@@ -1127,8 +1175,29 @@ def _run_propainter_chunked(
         cdir.mkdir(exist_ok=True)
         cvideo = cdir / "in.mp4"
         cmask = cdir / "masks"
-        cmask.mkdir(exist_ok=True)
         cout = cdir / "out"
+
+        # Resume: ProPainter writes to ``<cout>/<cvideo.stem>/inpaint_out.mp4``
+        # (i.e. <cout>/in/inpaint_out.mp4 since the slice is named in.mp4).
+        # If a prior run produced this file at a reasonable size, the
+        # chunk is already done -- skip slice + mask copy + inference,
+        # which is by far the longest stage in the pipeline.
+        existing = cout / cvideo.stem / "inpaint_out.mp4"
+        if existing.is_file() and existing.stat().st_size > 1024:
+            log.info(
+                "Chunk %d/%d: frames %d..%d -- REUSING existing output "
+                "(%.1f MB)",
+                idx + 1, n_chunks, start, last,
+                existing.stat().st_size / 1e6,
+            )
+            chunk_outputs.append(existing)
+            n_skipped += 1
+            continue
+
+        log.info("Chunk %d/%d: frames %d..%d (%d frames)",
+                 idx + 1, n_chunks, start, last, n)
+
+        cmask.mkdir(exist_ok=True)
         cout.mkdir(exist_ok=True)
 
         # ffmpeg slice the source video to this chunk's frame range
@@ -1151,6 +1220,10 @@ def _run_propainter_chunked(
         )
         chunk_outputs.append(produced)
 
+    if n_skipped:
+        log.info("ProPainter resume: reused %d/%d existing chunk outputs",
+                 n_skipped, n_chunks)
+
     # Concat the chunk outputs into one final video at the conventional
     # path our caller expects (output_dir/<video_stem>/inpaint_out.mp4).
     final_dir = output_dir / video.stem
@@ -1159,6 +1232,92 @@ def _run_propainter_chunked(
     _ffmpeg_concat(chunk_outputs, final, ffmpeg)
     log.info("Concatenated %d chunks -> %s", len(chunk_outputs), final)
     return final
+
+
+# --------------------------------------------------------------------------- #
+# DeAOT resume detection
+# --------------------------------------------------------------------------- #
+
+def _resume_threshold_met(
+    n_existing: int, n_expected: int, threshold: float = 0.95,
+) -> bool:
+    """Pure helper -- decide whether *n_existing* masks are "enough" to
+    treat as a successful prior DeAOT run.
+
+    A 5% shortfall is tolerated because ffprobe's ``nb_frames`` can be
+    slightly off for variable-fps containers / streams without an
+    accurate header. Anything below that is treated as an interrupted
+    prior run; we'll re-run DeAOT from scratch rather than feed a
+    truncated mask set into ProPainter (which would silently produce a
+    shorter output video than the source).
+    """
+    if n_existing <= 0 or n_expected <= 0:
+        return False
+    return n_existing >= n_expected * threshold
+
+
+def _try_resume_from_workspace_masks(
+    decode_source: Path,
+    workspace: Optional[Path],
+    ffmpeg: str,
+    ffprobe: Optional[str],
+):
+    """Detect a substantially-complete mask dump in *workspace* so we
+    can skip the SAM+DeAOT stage entirely on a re-run.
+
+    Background: SegTracker hard-codes its output to
+    ``<wm_path>/output/<stem>/<stem>_masks/``, which the main worker
+    then moves into ``<workspace>/<stem>/<stem>_masks/`` once DeAOT
+    finishes. If a previous run completed DeAOT but crashed in a
+    downstream stage (ProPainter, overlay, ...), the full mask set is
+    still on disk in the workspace -- but the next run wipes the
+    SegTracker staging dir and re-runs DeAOT from frame 0, costing
+    hours on long videos. This helper closes that gap.
+
+    Returns ``(mask_dir, out_root, frame_w, frame_h)`` on resume, or
+    ``None`` if no usable mask dump exists / the probe failed.
+    """
+    if workspace is None:
+        return None
+    expected_out = workspace / decode_source.stem
+    expected_masks = expected_out / f"{decode_source.stem}_masks"
+    if not expected_masks.is_dir():
+        return None
+    n_existing = sum(1 for _ in expected_masks.glob("*.png"))
+    if n_existing == 0:
+        return None
+
+    # Probe the intermediate for expected frame count + dimensions.
+    try:
+        with FfmpegVideoReader(decode_source, ffmpeg, ffprobe=ffprobe) as r:
+            frame_w, frame_h = r.width, r.height
+            n_expected = r.n_frames or 0
+    except Exception as e:  # noqa: BLE001
+        log.warning("Resume probe failed (%s); will re-run DeAOT", e)
+        return None
+
+    if n_expected == 0:
+        log.warning(
+            "ffprobe couldn't determine frame count for %s; cannot "
+            "safely resume from %d existing mask(s) -- re-running DeAOT.",
+            decode_source.name, n_existing,
+        )
+        return None
+
+    if not _resume_threshold_met(n_existing, n_expected):
+        log.info(
+            "Existing mask set has %d PNGs vs ~%d expected frames -- "
+            "looks like an interrupted DeAOT, re-running from scratch.",
+            n_existing, n_expected,
+        )
+        return None
+
+    log.info(
+        "Resume: found %d masks in workspace (%d expected); "
+        "SKIPPING SAM+DeAOT and feeding existing masks straight into "
+        "cleanup.", n_existing, n_expected,
+    )
+    return expected_masks, expected_out, frame_w, frame_h
 
 
 # --------------------------------------------------------------------------- #
@@ -1450,29 +1609,45 @@ def main() -> int:
     # the whole thing immediately afterwards so subsequent stages and
     # any leftover files live inside VSR Pro's tree, not in the
     # sibling watermark_remover repo.
-    mask_dir, out_root, frame_w, frame_h = _run_sam_and_deaot(
-        video=decode_source, clicks=clicks, aot_model=aot_model,
-        ffmpeg=ffmpeg, ffprobe=ffprobe,
+    #
+    # First, see if a prior run already produced a complete mask set in
+    # the workspace. If so, skip the (multi-hour on long videos) DeAOT
+    # propagation and re-use those masks. The cleanup pass + fast-path
+    # rewrite-skip will then make a second cleanup essentially free.
+    resumed = _try_resume_from_workspace_masks(
+        decode_source, workspace, ffmpeg, ffprobe,
     )
+    if resumed is not None:
+        mask_dir, out_root, frame_w, frame_h = resumed
+        # Mirror the progress emissions the SAM/DeAOT path would have
+        # made so the UI doesn't appear stuck at "loading 0%".
+        emit_progress("loading", 1.0, "resumed")
+        emit_progress("sam", 1.0, "resumed")
+        emit_progress("deaot", 1.0, "resumed")
+    else:
+        mask_dir, out_root, frame_w, frame_h = _run_sam_and_deaot(
+            video=decode_source, clicks=clicks, aot_model=aot_model,
+            ffmpeg=ffmpeg, ffprobe=ffprobe,
+        )
 
-    if workspace is not None:
-        workspace.mkdir(parents=True, exist_ok=True)
-        # Move (or copy + delete) the entire DeAOT output folder into
-        # the VSR-Pro-owned workspace, then re-anchor mask_dir / out_root
-        # to the relocated copy.
-        target = workspace / out_root.name
-        if target.exists():
-            shutil.rmtree(target, ignore_errors=True)
-        try:
-            shutil.move(str(out_root), str(workspace))
-        except Exception as e:  # noqa: BLE001
-            # Fallback to copy on cross-volume / file-busy situations
-            log.warning("Direct move failed (%s); copying instead", e)
-            shutil.copytree(str(out_root), str(target))
-            shutil.rmtree(str(out_root), ignore_errors=True)
-        out_root = target
-        mask_dir = out_root / mask_dir.name
-        log.info("Relocated DeAOT outputs -> %s", out_root)
+        if workspace is not None:
+            workspace.mkdir(parents=True, exist_ok=True)
+            # Move (or copy + delete) the entire DeAOT output folder into
+            # the VSR-Pro-owned workspace, then re-anchor mask_dir /
+            # out_root to the relocated copy.
+            target = workspace / out_root.name
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            try:
+                shutil.move(str(out_root), str(workspace))
+            except Exception as e:  # noqa: BLE001
+                # Fallback to copy on cross-volume / file-busy situations
+                log.warning("Direct move failed (%s); copying instead", e)
+                shutil.copytree(str(out_root), str(target))
+                shutil.rmtree(str(out_root), ignore_errors=True)
+            out_root = target
+            mask_dir = out_root / mask_dir.name
+            log.info("Relocated DeAOT outputs -> %s", out_root)
 
     # Stage 3: mask sanity pass. The cleanup pass now also returns the
     # raw union bbox + count of non-empty frames, so Stage 4 can skip
@@ -1524,11 +1699,46 @@ def main() -> int:
         crop_out = crop_workspace / "out"
         crop_out.mkdir(exist_ok=True)
 
-        # 4a. crop the cleaned intermediate
+        # 4a. crop the cleaned intermediate -- skip when a prior run
+        # already produced a probe-parseable file at the same path.
+        # Trust ffprobe over size alone because NVENC can leave a
+        # ~half-meg partial file with no moov atom on a kill.
         emit_progress("crop", 0.0)
-        _crop_video(decode_source, crop_video, cx, cy, cw, ch, ffmpeg)
-        # 4b. crop the masks
-        _crop_masks(mask_dir, crop_masks, cx, cy, cw, ch)
+        crop_video_ok = False
+        if crop_video.is_file() and crop_video.stat().st_size > 1024:
+            if ffprobe:
+                probe = subprocess.run(
+                    [ffprobe, "-v", "error", "-show_entries",
+                     "stream=width,height", "-of", "csv", str(crop_video)],
+                    capture_output=True, text=True, timeout=15,
+                    creationflags=_NO_WINDOW,
+                )
+                crop_video_ok = (probe.returncode == 0 and
+                                 "stream" in probe.stdout)
+            else:
+                crop_video_ok = True  # best effort if no ffprobe
+        if crop_video_ok:
+            log.info("Re-using existing crop video %s (%.1f MB)",
+                     crop_video.name, crop_video.stat().st_size / 1e6)
+        else:
+            crop_video.unlink(missing_ok=True)
+            _crop_video(decode_source, crop_video, cx, cy, cw, ch, ffmpeg)
+
+        # 4b. crop the masks -- skip when count matches the cleaned set
+        # AND the dest is non-empty. The crop is deterministic given
+        # the same bbox, so this is safe.
+        expected_n = sum(1 for _ in mask_dir.glob("*.png"))
+        existing_n = (sum(1 for _ in crop_masks.glob("*.png"))
+                      if crop_masks.is_dir() else 0)
+        if existing_n == expected_n and expected_n > 0:
+            log.info("Re-using %d existing cropped masks in %s",
+                     existing_n, crop_masks)
+        else:
+            if crop_masks.is_dir() and existing_n != expected_n:
+                log.info("Crop-mask count drifted (%d on disk vs %d "
+                         "expected); regenerating.", existing_n, expected_n)
+                shutil.rmtree(crop_masks, ignore_errors=True)
+            _crop_masks(mask_dir, crop_masks, cx, cy, cw, ch)
         emit_progress("crop", 1.0)
         # 5. ProPainter on the crop (chunks internally for long videos)
         emit_progress("propainter", 0.0, f"{cw}x{ch}")

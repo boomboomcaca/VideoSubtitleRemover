@@ -172,6 +172,265 @@ class TestMaskCleanupIdempotent(unittest.TestCase):
         self.assertEqual((out > 0).sum(), 400)
 
 
+class TestCleanupSidecar(unittest.TestCase):
+    """Cleanup writes a JSON sidecar with {n_masks, union_bbox,
+    n_with_content} on success. A re-run that finds a valid sidecar
+    skips the entire per-frame cleanup pass -- this is what lets a
+    98K-mask resume return in milliseconds instead of ~5-10 min."""
+
+    def setUp(self):
+        try:
+            from PIL import Image  # noqa: F401
+            import numpy as np  # noqa: F401
+        except ImportError:
+            self.skipTest("PIL/numpy unavailable")
+        import shutil as _shutil
+        self.tmp = Path(tempfile.mkdtemp(prefix="vsr_sidecar_test_"))
+        self._addCleanup = lambda: _shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def tearDown(self):
+        self._addCleanup()
+
+    def _make_masks(self, mask_dir, n, value=255):
+        from PIL import Image
+        import numpy as np
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            arr = np.zeros((50, 50), dtype=np.uint8)
+            arr[20:30, 20:30] = value
+            Image.fromarray(arr).save(mask_dir / f"{i:05d}.png")
+
+    def test_sidecar_written_on_completion(self):
+        import json
+        from backend.dynamic._worker import _clean_segtracker_masks
+        mask_dir = self.tmp / "masks"
+        self._make_masks(mask_dir, 3, value=1)  # {0,1} from DeAOT
+        n, bb, nwc = _clean_segtracker_masks(mask_dir)
+        sidecar = mask_dir.parent / f"{mask_dir.name}_cleanup.json"
+        self.assertTrue(sidecar.is_file(), "sidecar not written")
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        self.assertEqual(data["schema_version"], 1)
+        self.assertEqual(data["n_masks"], 3)
+        self.assertEqual(data["n_with_content"], 3)
+        # 20x20 square -> inclusive bbox (20, 20, 29, 29)
+        self.assertEqual(data["union_bbox"], [20, 20, 29, 29])
+
+    def test_sidecar_short_circuits_second_run(self):
+        from backend.dynamic._worker import _clean_segtracker_masks
+        mask_dir = self.tmp / "masks"
+        self._make_masks(mask_dir, 4, value=1)
+        # First run: writes sidecar
+        n1, bb1, nwc1 = _clean_segtracker_masks(mask_dir)
+        sidecar = mask_dir.parent / f"{mask_dir.name}_cleanup.json"
+        first_mtime = sidecar.stat().st_mtime_ns
+        # Sleep so any new write would change the mtime detectably
+        import time
+        time.sleep(1.05)
+        # Touch one of the mask files BACKWARDS in time to prove the
+        # second call did NOT touch it (would update mtime if rewritten).
+        target = mask_dir / "00002.png"
+        target_mtime_before = target.stat().st_mtime_ns
+        # Second run: should hit the sidecar fast-path
+        n2, bb2, nwc2 = _clean_segtracker_masks(mask_dir)
+        self.assertEqual((n1, bb1, nwc1), (n2, bb2, nwc2))
+        # Sidecar was NOT rewritten (no new payload to persist)
+        self.assertEqual(sidecar.stat().st_mtime_ns, first_mtime)
+        # The mask file was NOT touched either
+        self.assertEqual(target.stat().st_mtime_ns, target_mtime_before)
+
+    def test_sidecar_ignored_when_mask_count_mismatches(self):
+        import json
+        from backend.dynamic._worker import _clean_segtracker_masks
+        mask_dir = self.tmp / "masks"
+        self._make_masks(mask_dir, 5, value=1)
+        # Run once to get a sidecar
+        _clean_segtracker_masks(mask_dir)
+        sidecar = mask_dir.parent / f"{mask_dir.name}_cleanup.json"
+        self.assertTrue(sidecar.is_file())
+        # Now delete one mask -- count drifts from cached 5 to 4
+        (mask_dir / "00003.png").unlink()
+        # Re-run: must NOT trust the sidecar; should re-process the 4
+        # remaining masks and rewrite the sidecar with n=4.
+        n, bb, nwc = _clean_segtracker_masks(mask_dir)
+        self.assertEqual(n, 4)
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        self.assertEqual(data["n_masks"], 4)
+
+
+class TestWorkspaceModule(unittest.TestCase):
+    """backend.dynamic.workspace backs both the CLI cleanup tool and the
+    GUI pre-launch confirm dialog. A bug here silently corrupts both
+    cache-management code paths, so the per-stage detection logic must
+    be locked down by tests."""
+
+    def setUp(self):
+        import shutil as _shutil
+        self.tmp = Path(tempfile.mkdtemp(prefix="vsr_workspace_test_"))
+        self._addCleanup = lambda: _shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def tearDown(self):
+        self._addCleanup()
+
+    def _make_full_workspace(self):
+        """Mirror the on-disk layout the worker produces post-pipeline:
+        intermediate mp4, mask dir, sidecar, crop dir, chunks with output
+        mp4s. Every helper field should report yes/non-zero on this fixture.
+        """
+        ws = self.tmp / "fixture_workspace"
+        (ws / "_source_clean").mkdir(parents=True)
+        (ws / "_source_clean.mp4").write_bytes(b"\0" * 2048)
+        masks = ws / "_source_clean" / "_source_clean_masks"
+        masks.mkdir()
+        for i in range(3):
+            (masks / f"{i:05d}.png").write_bytes(b"\0" * 512)
+        sidecar = ws / "_source_clean" / "_source_clean_masks_cleanup.json"
+        sidecar.write_text('{"schema_version": 1, "n_masks": 3}',
+                           encoding="utf-8")
+        crop_dir = ws / "_source_clean" / "_crop"
+        crop_dir.mkdir(parents=True)
+        (crop_dir / "_source_clean_crop.mp4").write_bytes(b"\0" * 4096)
+        crop_masks = crop_dir / "masks"
+        crop_masks.mkdir()
+        for i in range(3):
+            (crop_masks / f"{i:05d}.png").write_bytes(b"\0" * 256)
+        chunks = crop_dir / "out" / "_chunks"
+        for i in range(2):
+            c = chunks / f"c{i:04d}" / "out" / "in"
+            c.mkdir(parents=True)
+            (c / "inpaint_out.mp4").write_bytes(b"\0" * 8192)
+        # An incomplete chunk -- a tiny file that the resume threshold
+        # should NOT count as done.
+        c_partial = chunks / "c0002" / "out" / "in"
+        c_partial.mkdir(parents=True)
+        (c_partial / "inpaint_out.mp4").write_bytes(b"\0" * 100)
+        return ws
+
+    def test_describe_empty(self):
+        from backend.dynamic.workspace import describe_workspace
+        s = describe_workspace(self.tmp / "does_not_exist")
+        self.assertFalse(s.exists)
+        self.assertFalse(s.has_any_cache)
+
+    def test_describe_full_workspace(self):
+        from backend.dynamic.workspace import describe_workspace
+        ws = self._make_full_workspace()
+        s = describe_workspace(ws)
+        self.assertTrue(s.exists)
+        self.assertTrue(s.intermediate_exists)
+        self.assertEqual(s.n_masks, 3)
+        self.assertTrue(s.cleanup_sidecar_exists)
+        self.assertTrue(s.crop_video_exists)
+        self.assertEqual(s.n_crop_masks, 3)
+        # Only the 2 real chunks count; the 100-byte partial is excluded
+        self.assertEqual(s.n_chunks_done, 2)
+        self.assertGreater(s.size_bytes, 0)
+        self.assertTrue(s.has_any_cache)
+        bullets = s.stage_summary()
+        self.assertTrue(any("Reencoded" in b for b in bullets))
+        self.assertTrue(any("DeAOT" in b for b in bullets))
+
+    def test_wipe_full(self):
+        from backend.dynamic.workspace import (
+            describe_workspace, wipe_workspace,
+        )
+        ws = self._make_full_workspace()
+        self.assertTrue(wipe_workspace(ws))
+        s = describe_workspace(ws)
+        # Workspace dir itself is kept (the next run reuses it); all
+        # cached stages should be gone.
+        self.assertFalse(s.intermediate_exists)
+        self.assertEqual(s.n_masks, 0)
+        self.assertFalse(s.cleanup_sidecar_exists)
+        self.assertFalse(s.crop_video_exists)
+        self.assertEqual(s.n_crop_masks, 0)
+        self.assertEqual(s.n_chunks_done, 0)
+        self.assertFalse(s.has_any_cache)
+
+    def test_wipe_keep_source_clean(self):
+        from backend.dynamic.workspace import (
+            describe_workspace, wipe_workspace,
+        )
+        ws = self._make_full_workspace()
+        self.assertTrue(wipe_workspace(ws, keep_source_clean=True))
+        s = describe_workspace(ws)
+        # Intermediate preserved, everything else gone
+        self.assertTrue(s.intermediate_exists)
+        self.assertEqual(s.n_masks, 0)
+        self.assertEqual(s.n_chunks_done, 0)
+
+    def test_wipe_only_propainter(self):
+        from backend.dynamic.workspace import (
+            describe_workspace, wipe_workspace,
+        )
+        ws = self._make_full_workspace()
+        self.assertTrue(wipe_workspace(ws, only_propainter=True))
+        s = describe_workspace(ws)
+        # ProPainter chunks gone; everything before propainter preserved
+        self.assertTrue(s.intermediate_exists)
+        self.assertEqual(s.n_masks, 3)
+        self.assertTrue(s.cleanup_sidecar_exists)
+        self.assertTrue(s.crop_video_exists)
+        self.assertEqual(s.n_crop_masks, 3)
+        self.assertEqual(s.n_chunks_done, 0)
+
+    def test_workspace_for_video_is_stable_and_path_keyed(self):
+        from backend.dynamic.workspace import workspace_for_video
+        v1 = self.tmp / "subdir_a" / "movie.mp4"
+        v2 = self.tmp / "subdir_b" / "movie.mp4"
+        v1.parent.mkdir(parents=True)
+        v2.parent.mkdir(parents=True)
+        v1.touch()
+        v2.touch()
+        # Same path, different times -> stable
+        self.assertEqual(workspace_for_video(v1), workspace_for_video(v1))
+        # Same stem, different absolute path -> different workspace
+        # (this is the bug that the sha1(path) suffix prevents)
+        self.assertNotEqual(workspace_for_video(v1), workspace_for_video(v2))
+
+    def test_format_size_units(self):
+        from backend.dynamic.workspace import format_size
+        self.assertEqual(format_size(0), "0 B")
+        self.assertEqual(format_size(512), "512 B")
+        self.assertEqual(format_size(2048), "2.0 KB")
+        self.assertEqual(format_size(2 * 1024 * 1024), "2.0 MB")
+        self.assertEqual(format_size(int(3.2 * 1024 ** 3)), "3.2 GB")
+
+
+class TestResumeThreshold(unittest.TestCase):
+    """The DeAOT-skip resume detection MUST refuse partial mask sets --
+    feeding them into ProPainter silently truncates the output video.
+    A 5% shortfall is allowed because ffprobe's nb_frames is unreliable
+    on some variable-fps containers."""
+
+    def test_empty_inputs_return_false(self):
+        from backend.dynamic._worker import _resume_threshold_met
+        self.assertFalse(_resume_threshold_met(0, 100))
+        self.assertFalse(_resume_threshold_met(100, 0))
+        self.assertFalse(_resume_threshold_met(0, 0))
+        self.assertFalse(_resume_threshold_met(-1, 100))
+
+    def test_well_below_threshold_rejected(self):
+        from backend.dynamic._worker import _resume_threshold_met
+        # 1972/98668 = 2% -- the exact pathological case the user hit
+        self.assertFalse(_resume_threshold_met(1972, 98668))
+        self.assertFalse(_resume_threshold_met(50, 100))
+        self.assertFalse(_resume_threshold_met(94, 100))  # just under 95%
+
+    def test_at_or_above_threshold_accepted(self):
+        from backend.dynamic._worker import _resume_threshold_met
+        self.assertTrue(_resume_threshold_met(95, 100))   # exact threshold
+        self.assertTrue(_resume_threshold_met(100, 100))
+        self.assertTrue(_resume_threshold_met(98668, 98668))
+        # 5% ffprobe undercount on a long video -- still resume
+        self.assertTrue(_resume_threshold_met(98668, 100000))
+
+    def test_more_masks_than_frames_accepted(self):
+        # Defensive: if ffprobe under-reports we should still resume,
+        # never the other way around.
+        from backend.dynamic._worker import _resume_threshold_met
+        self.assertTrue(_resume_threshold_met(101, 100))
+
+
 class TestParseDeaotFrame(unittest.TestCase):
     """Regression: parent must turn SegTracker's plain-stdout
     'processed frame N' chatter into per-frame DeAOT progress updates

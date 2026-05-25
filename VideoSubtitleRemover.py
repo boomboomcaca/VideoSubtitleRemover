@@ -5464,6 +5464,38 @@ class VideoSubtitleRemoverApp:
         src = _Path(source_path)
         out = src.with_name(f"{src.stem}_clean.mp4")
 
+        # Pre-launch cache check: if a prior run left intermediates on
+        # disk (DeAOT masks, ProPainter chunks, ...), ask the user whether
+        # to resume from them or start fresh. The worker itself will only
+        # resume from a SUBSTANTIALLY-complete mask set, but the user
+        # should still have the choice -- e.g. if they changed click
+        # points, the cached masks are stale.
+        try:
+            from backend.dynamic.workspace import (
+                describe_workspace,
+                wipe_workspace,
+                workspace_for_video,
+            )
+            ws = workspace_for_video(src)
+            state = describe_workspace(ws)
+            if state.has_any_cache:
+                choice = self._show_cache_confirm_dialog(src, state)
+                if choice == "cancel":
+                    return
+                if choice == "wipe":
+                    if not wipe_workspace(ws):
+                        tk.messagebox.showerror(
+                            "Cache wipe failed",
+                            "Could not delete every cached file. Make sure "
+                            "no other dynamic-mode pipeline is running for "
+                            "this video, then try again.",
+                            parent=self.root,
+                        )
+                        return
+        except Exception:  # noqa: BLE001
+            logger.exception("Pre-launch cache check failed; continuing "
+                             "without prompting")
+
         # Build a small progress Toplevel
         prog_win = tk.Toplevel(self.root)
         prog_win.title("Removing watermark...")
@@ -5572,6 +5604,135 @@ class VideoSubtitleRemoverApp:
         close_btn_var["btn"] = close_btn
 
         threading.Thread(target=_bg, daemon=True).start()
+
+    def _show_cache_confirm_dialog(self, video_path, state):
+        """Modal: "found cached work for this video, what now?".
+
+        Returns one of "use", "wipe", or "cancel". Cancel is the default
+        for the close-button and Escape key so accidentally dismissing
+        the dialog can never trigger a destructive wipe.
+        """
+        from backend.dynamic.workspace import format_size
+
+        result = {"choice": "cancel"}
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Cached intermediates found")
+        dlg.configure(bg=Theme.BG_OVERLAY)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        # Resizable so users with unusual font scaling can still reach
+        # the buttons if our packed-bottom guarantee somehow fails.
+        dlg.resizable(True, True)
+
+        def _pick(choice):
+            result["choice"] = choice
+            try:
+                dlg.grab_release()
+            except tk.TclError:
+                pass
+            dlg.destroy()
+
+        # IMPORTANT: pack the button row FIRST with side="bottom" so it
+        # claims its space at the bottom of the dialog before the content
+        # widgets get a chance to consume it. With the previous (content-
+        # first) ordering, a heading + bullets + paragraph combo could
+        # eat the whole dialog on high-DPI displays and push the actions
+        # off-screen -- exactly the "无法操作" symptom seen in the wild.
+        btn_row = tk.Frame(dlg, bg=Theme.BG_OVERLAY)
+        btn_row.pack(side="bottom", fill="x",
+                     padx=Theme.S_LG, pady=Theme.S_LG)
+
+        # Right-anchored: primary (Use cache) on the far right, then Wipe.
+        # Cancel on the left so the destructive option isn't adjacent to
+        # the recommended one.
+        ModernButton(
+            btn_row, text="Cancel", command=lambda: _pick("cancel"),
+            width=80, style="ghost", size="sm",
+        ).pack(side="left")
+        ModernButton(
+            btn_row, text="Use cache (resume)",
+            command=lambda: _pick("use"),
+            width=160, style="success", size="sm",
+        ).pack(side="right")
+        ModernButton(
+            btn_row, text="Wipe and start fresh",
+            command=lambda: _pick("wipe"),
+            width=160, style="secondary", size="sm",
+        ).pack(side="right", padx=(0, Theme.S_SM))
+
+        # Content area (top of dialog, fills remaining space).
+        content = tk.Frame(dlg, bg=Theme.BG_OVERLAY)
+        content.pack(side="top", fill="both", expand=True)
+
+        tk.Label(
+            content, text="Cached intermediates found for this video",
+            font=f(Theme.F_HEADING, "bold"),
+            bg=Theme.BG_OVERLAY, fg=Theme.TEXT_PRIMARY,
+            anchor="w",
+        ).pack(fill="x", padx=Theme.S_LG, pady=(Theme.S_LG, Theme.S_XS))
+
+        tk.Label(
+            content, text=truncate_middle(video_path.name, 70),
+            font=f(Theme.F_BODY_SM),
+            bg=Theme.BG_OVERLAY, fg=Theme.TEXT_MUTED,
+            anchor="w",
+        ).pack(fill="x", padx=Theme.S_LG)
+
+        # Bulleted stage summary
+        bullets_box = tk.Frame(
+            content, bg=Theme.BG_CARD,
+            highlightthickness=1, highlightbackground=Theme.BORDER_SUBTLE,
+        )
+        bullets_box.pack(fill="x", padx=Theme.S_LG, pady=(Theme.S_MD, Theme.S_SM))
+        for line in state.stage_summary():
+            tk.Label(
+                bullets_box, text=f"  •  {line}",
+                font=f(Theme.F_BODY_SM),
+                bg=Theme.BG_CARD, fg=Theme.TEXT_SECONDARY,
+                anchor="w",
+            ).pack(fill="x", padx=Theme.S_SM, pady=2)
+        tk.Label(
+            bullets_box,
+            text=f"  Total size on disk: {format_size(state.size_bytes)}",
+            font=f(Theme.F_META),
+            bg=Theme.BG_CARD, fg=Theme.TEXT_MUTED,
+            anchor="w",
+        ).pack(fill="x", padx=Theme.S_SM, pady=(Theme.S_SM, Theme.S_XS))
+
+        tk.Label(
+            content,
+            text=(
+                "Resuming reuses every stage that's already done -- the "
+                "fastest option (recommended). Wipe everything if the "
+                "click points / video content / parameters changed since "
+                "the cached run, otherwise the resumed output will be wrong."
+            ),
+            font=f(Theme.F_META),
+            bg=Theme.BG_OVERLAY, fg=Theme.TEXT_SECONDARY,
+            anchor="w", justify="left",
+            wraplength=_scaled(self.root, 540),
+        ).pack(fill="x", padx=Theme.S_LG, pady=(Theme.S_SM, Theme.S_LG))
+
+        # Now that everything is laid out, let Tk compute the required
+        # size and centre on the parent. Cap to a reasonable max in case
+        # the user's font scaling makes the dialog absurdly tall.
+        dlg.update_idletasks()
+        req_w = max(dlg.winfo_reqwidth(), _scaled(self.root, 580))
+        req_h = max(dlg.winfo_reqheight(), _scaled(self.root, 360))
+        try:
+            px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
+            pw, ph = self.root.winfo_width(), self.root.winfo_height()
+            x = px + max(0, (pw - req_w) // 2)
+            y = py + max(0, (ph - req_h) // 3)
+            dlg.geometry(f"{req_w}x{req_h}+{x}+{y}")
+        except Exception:  # noqa: BLE001
+            dlg.geometry(f"{req_w}x{req_h}")
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _pick("cancel"))
+        dlg.bind("<Escape>", lambda _e: _pick("cancel"))
+        dlg.wait_window()
+        return result["choice"]
 
     def _show_about(self):
         """Open a themed About dialog with version, credits, and quick links."""
