@@ -164,8 +164,13 @@ def _build_parser() -> argparse.ArgumentParser:
     fp.add_argument("--no-fp16", dest="fp16", action="store_false",
                     help="Disable FP16 in ProPainter.")
     p.add_argument("--keep-intermediates", action="store_true",
-                   help="Reserved; intermediates are never auto-deleted "
-                        "in the MVP. Flag kept for forward compatibility.")
+                   help="Preserve workspace (masks, chunked mp4s, "
+                        "pre-encoded source) after a successful run "
+                        "instead of deleting it. Default is to free "
+                        "the 2-4 GB those intermediates occupy. "
+                        "Failed runs ALWAYS preserve the workspace "
+                        "regardless of this flag, so dynamic_resume_"
+                        "from_masks.py can pick up from the crash.")
     p.add_argument("--no-progress", dest="progress", action="store_false",
                    default=True,
                    help="Suppress the inline phase-progress reporter.")

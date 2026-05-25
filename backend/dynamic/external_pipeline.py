@@ -23,9 +23,11 @@ extras; until then, MVP users keep the two repos side-by-side.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -248,7 +250,7 @@ def run_dynamic_removal(
     aot_model: str = "r50_deaotl",
     auto_crop: bool = True,
     crop_padding: int = 96,
-    keep_intermediates: bool = False,  # noqa: ARG001 (forward-compat)
+    keep_intermediates: bool = False,
     stream_to_stderr: bool = True,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> DynamicRemovalResult:
@@ -320,8 +322,19 @@ def run_dynamic_removal(
     # __file__), so the worker stages them there briefly and then
     # relocates everything into this workspace before running
     # ProPainter / ffmpeg.
+    #
+    # Workspace key is ``<stem>_<sha1(abs_path)[:8]>`` rather than just
+    # ``<stem>``. Two different videos that happen to share a stem
+    # (e.g. ~/dl/video.mp4 and ~/backup/video.mp4) would otherwise both
+    # route to ``output/dynamic/video/`` and the second run would silently
+    # reuse the first's ``_source_clean.mp4`` -- which was encoded from
+    # the wrong source -- producing garbage output with no error.
+    # Hashing the absolute path keeps "same file rerun" → "same key"
+    # (preserves the _source_clean.mp4 reuse fast-path for retries)
+    # while making "same name, different file" → "different key".
     repo_root = Path(__file__).resolve().parents[2]
-    workspace = repo_root / "output" / "dynamic" / video.stem
+    path_hash = hashlib.sha1(str(video).encode("utf-8")).hexdigest()[:8]
+    workspace = repo_root / "output" / "dynamic" / f"{video.stem}_{path_hash}"
     workspace.mkdir(parents=True, exist_ok=True)
     logger.info("Dynamic intermediates workspace: %s", workspace)
 
@@ -443,6 +456,23 @@ def run_dynamic_removal(
         raise FileNotFoundError(
             f"Worker reported success but output file missing: {out_path}"
         )
+
+    # Workspace lifecycle: this point is the only place we can prove the
+    # run succeeded end-to-end (worker exited 0, sentinel parsed, final
+    # mp4 on disk). Drop the 2-4 GB of intermediates unless the caller
+    # opted in to keep them.
+    #
+    # Failure paths -- worker non-zero rc, missing sentinel, missing
+    # output -- raise BEFORE reaching here, so the workspace is naturally
+    # preserved for inspection / for tool/dynamic_resume_from_masks.py
+    # to pick up. The workspace path was logged at start of run.
+    if not keep_intermediates:
+        try:
+            shutil.rmtree(workspace, ignore_errors=True)
+            logger.info("Cleaned up workspace: %s", workspace)
+        except Exception:  # noqa: BLE001
+            logger.warning("Workspace cleanup failed at %s",
+                           workspace, exc_info=True)
 
     return DynamicRemovalResult(
         output_video=out_path,

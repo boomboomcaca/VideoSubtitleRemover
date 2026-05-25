@@ -1144,6 +1144,18 @@ def _run_sam_and_deaot(
     video_stem = video.stem
     out_root = WM_PATH / "output" / video_stem
     mask_dir = out_root / f"{video_stem}_masks"
+    # Wipe any stale state from an interrupted prior run before DeAOT
+    # starts writing. Otherwise: prior run crashed at frame 50000 (left
+    # masks 00000..49999.png in here, not yet moved to workspace), this
+    # run crashes at frame 30000, masks 30000..49999 are stale tail
+    # from prior run. Downstream _compute_bbox globs *.png and would
+    # union the stale-tail mask positions into the bbox -- typically
+    # bloating it past the 60% auto-crop guard and forcing full-frame
+    # ProPainter (instant OOM on consumer GPUs).
+    if out_root.exists():
+        log.info("Wiping stale DeAOT staging dir before fresh run: %s",
+                 out_root)
+        shutil.rmtree(out_root, ignore_errors=True)
     out_root.mkdir(parents=True, exist_ok=True)
     _propagate_masks_streaming(
         tracker, video, mask_dir,
