@@ -338,6 +338,23 @@ def run_dynamic_removal(
     workspace.mkdir(parents=True, exist_ok=True)
     logger.info("Dynamic intermediates workspace: %s", workspace)
 
+    # Orphan detection: workspaces created before the hash-suffix rename
+    # live at ``output/dynamic/<stem>/`` (no suffix). Auto-cleanup never
+    # touches them because the cleanup path keys off the current workspace.
+    # Warn so the user can delete manually; we don't auto-delete because
+    # two different videos could have collided into the same legacy dir
+    # back when the bug was live, and we have no way to know which one
+    # is the rightful owner.
+    legacy_workspace = repo_root / "output" / "dynamic" / video.stem
+    if legacy_workspace.is_dir() and legacy_workspace != workspace:
+        logger.warning(
+            "Detected legacy (pre-hash) workspace at %s -- this is an "
+            "orphan from before the workspace naming change and will not "
+            "be auto-cleaned. Safe to delete manually after confirming "
+            "any prior runs of this video produced good output.",
+            legacy_workspace,
+        )
+
     payload = {
         "video": str(video),
         "output": str(output),
