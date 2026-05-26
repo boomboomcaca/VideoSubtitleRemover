@@ -2967,7 +2967,14 @@ class VideoSubtitleRemoverApp:
         self._sync_config_from_ui()
         # Persist window layout and panel states for next launch
         try:
-            self.config.window_geometry = self.root.geometry()
+            # When maximized, geometry() returns the full-screen dimensions
+            # which, on next launch, produces a non-centered non-maximized
+            # full-screen window. Save empty geometry so the centering
+            # fallback kicks in instead.
+            if self.root.state() == "zoomed":
+                self.config.window_geometry = ""
+            else:
+                self.config.window_geometry = self.root.geometry()
             self.config.adv_panel_open = self.adv_visible
             self.config.log_panel_open = self._log_visible
         except Exception:
