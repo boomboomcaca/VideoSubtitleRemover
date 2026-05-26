@@ -868,10 +868,88 @@ def _crop_masks(
     return n
 
 
+def _build_overlay_filter(
+    x: int, y: int, *, mask_input_idx: Optional[int], feather_px: int,
+) -> str:
+    """Build the ffmpeg ``-filter_complex`` graph for the overlay step.
+
+    Two modes, both isolated here so the test suite can verify the
+    exact graph without spawning ffmpeg.
+
+    Hard-edge mode (``mask_input_idx is None``)
+        Legacy behaviour: ``[0:v][1:v]overlay=x:y``. The entire bbox
+        rectangle of inpainted output replaces the corresponding region
+        of the base, producing a visible rectangular seam at the bbox
+        edges because ProPainter slightly shifts colour/lighting on
+        unmasked pixels inside the bbox.
+
+    Alpha-feathered mode (``mask_input_idx`` is an integer >= 2)
+        Use the mask sequence as the alpha channel: only pixels that
+        the watermark actually covered get replaced, plus a
+        ``feather_px``-wide ramp at the mask edges (gaussian-like via
+        ``boxblur``) so the transition is sub-pixel and invisible.
+    """
+    if mask_input_idx is None:
+        return f"[0:v][1:v]overlay={x}:{y}:eof_action=pass"
+
+    # boxblur with luma_radius=feather_px and luma_power=1 gives a
+    # soft 2*feather_px-wide ramp at the mask edge. format=gray
+    # ensures the mask reads as luma regardless of how ffmpeg
+    # decoded the PNG sequence (always grayscale in our case but
+    # being explicit is cheap).
+    return (
+        f"[{mask_input_idx}:v]format=gray,boxblur={feather_px}:1[mfeath];"
+        f"[1:v][mfeath]alphamerge[crop_a];"
+        f"[0:v][crop_a]overlay={x}:{y}:eof_action=pass"
+    )
+
+
+def _probe_fps(video: Path, ffprobe: str) -> Optional[float]:
+    """Average frame rate of *video* via ffprobe, or None on failure."""
+    try:
+        proc = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             str(video)],
+            capture_output=True, text=True, timeout=15,
+            creationflags=_NO_WINDOW,
+        )
+        if proc.returncode != 0:
+            return None
+        frac = proc.stdout.strip()
+        if "/" in frac:
+            num, den = frac.split("/", 1)
+            num_i = int(num)
+            den_i = int(den)
+            if den_i == 0:
+                return None
+            return num_i / den_i
+        return float(frac) if frac else None
+    except (subprocess.SubprocessError, ValueError):
+        return None
+
+
 def _overlay(
     base: Path, crop: Path, out: Path, x: int, y: int, ffmpeg: str,
+    *,
+    mask_seq_dir: Optional[Path] = None,
+    feather_px: int = 5,
+    fps: Optional[float] = None,
 ) -> None:
     """Overlay *crop* on *base* at ``(x, y)`` -> *out*, preserving audio.
+
+    When ``mask_seq_dir`` is provided (default in the main pipeline),
+    the PNG mask sequence inside it is fed as the alpha channel for
+    *crop* and a ``feather_px``-radius boxblur smooths the mask edge,
+    so only the actual watermark pixels (with a soft ramp) replace the
+    base. This eliminates the rectangular bbox seam that the hard-edge
+    overlay used to leave at the auto-crop boundary.
+
+    When ``mask_seq_dir`` is None we fall back to the hard-edge paste --
+    kept for backward compatibility and as an escape hatch if a future
+    issue with the alpha path appears (set the kwarg to None to
+    bisect).
 
     Critical: NO ``-shortest`` flag. If the inpaint stream is shorter
     than the source (e.g., DeAOT processed fewer frames than the source
@@ -880,36 +958,64 @@ def _overlay(
     just pass through unmodified. ``-shortest`` would truncate the
     output to the shorter input, which previously cost a user the back
     22 minutes of a 27-minute video.
-
-    The ``overlay`` filter naturally stops applying once its second
-    input ends, while continuing to forward the base stream.
     """
-    log.info("ffmpeg overlay %s onto %s at (%d,%d) -> %s",
-             crop.name, base.name, x, y, out.name)
-    overlay_filter = f"[0:v][1:v]overlay={x}:{y}:eof_action=pass"
-    cmd_nvenc = [
-        ffmpeg, "-y", "-loglevel", "error",
-        "-i", str(base),
-        "-i", str(crop),
-        "-filter_complex", overlay_filter,
+    use_mask = mask_seq_dir is not None
+    if use_mask:
+        if not mask_seq_dir.is_dir():
+            raise FileNotFoundError(
+                f"mask_seq_dir does not exist: {mask_seq_dir}"
+            )
+        first_mask = mask_seq_dir / "00000.png"
+        if not first_mask.is_file():
+            raise FileNotFoundError(
+                f"mask_seq_dir is empty (no 00000.png): {mask_seq_dir}"
+            )
+        if fps is None or fps <= 0:
+            raise ValueError(
+                "fps must be provided (and positive) when using "
+                "mask_seq_dir"
+            )
+
+    log.info(
+        "ffmpeg overlay %s onto %s at (%d,%d) -> %s (alpha=%s)",
+        crop.name, base.name, x, y, out.name,
+        f"feather={feather_px}" if use_mask else "hard-edge",
+    )
+
+    filter_complex = _build_overlay_filter(
+        x, y,
+        mask_input_idx=2 if use_mask else None,
+        feather_px=feather_px,
+    )
+
+    inputs = ["-i", str(base), "-i", str(crop)]
+    if use_mask:
+        inputs += [
+            "-framerate", f"{fps:.6f}",
+            "-i", str(mask_seq_dir / "%05d.png"),
+        ]
+
+    def _build_cmd(codec_args):
+        return [
+            ffmpeg, "-y", "-loglevel", "error",
+            *inputs,
+            "-filter_complex", filter_complex,
+            *codec_args,
+            "-c:a", "copy",
+            str(out),
+        ]
+
+    cmd_nvenc = _build_cmd([
         "-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "18",
-        "-c:a", "copy",
-        str(out),
-    ]
+    ])
     rc = subprocess.call(cmd_nvenc, creationflags=_NO_WINDOW)
     if rc == 0 and out.is_file() and out.stat().st_size > 1024:
         return
     log.warning("NVENC overlay failed (rc=%d); falling back to libx264", rc)
     out.unlink(missing_ok=True)
-    cmd_x264 = [
-        ffmpeg, "-y", "-loglevel", "error",
-        "-i", str(base),
-        "-i", str(crop),
-        "-filter_complex", overlay_filter,
+    cmd_x264 = _build_cmd([
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-c:a", "copy",
-        str(out),
-    ]
+    ])
     rc = subprocess.call(cmd_x264, creationflags=_NO_WINDOW)
     if rc != 0:
         raise RuntimeError(f"ffmpeg overlay failed (exit {rc})")
@@ -1861,6 +1967,25 @@ def main() -> int:
         crop_out = crop_workspace / "out"
         crop_out.mkdir(exist_ok=True)
 
+        # Persist bbox + source frame dims so a later recomposite pass
+        # (tool/dynamic_recomposite.py) can re-do the overlay step
+        # without re-running ProPainter. Cheap (~50 bytes) and protects
+        # against re-deriving the padded+aligned bbox from masks, which
+        # would be off by a few pixels.
+        import json as _json
+        bbox_sidecar = crop_workspace / "_bbox.json"
+        try:
+            with open(bbox_sidecar, "w", encoding="utf-8") as _fh:
+                _json.dump({
+                    "schema_version": 1,
+                    "x": int(cx), "y": int(cy),
+                    "w": int(cw), "h": int(ch),
+                    "frame_w": int(frame_w), "frame_h": int(frame_h),
+                }, _fh)
+        except OSError as _e:
+            log.warning("Failed to write bbox sidecar %s: %s",
+                        bbox_sidecar, _e)
+
         # 4a. crop the cleaned intermediate -- skip when a prior run
         # already produced a probe-parseable file at the same path.
         # Trust ffprobe over size alone because NVENC can leave a
@@ -1916,9 +2041,28 @@ def main() -> int:
         # 6. overlay back onto the cleaned base (cleaned has same length
         # as original; using cleaned as base avoids re-introducing the
         # decode quirks we paid to fix in Stage 0).
+        #
+        # Use the cropped masks as a feathered alpha channel so only
+        # the actual watermark pixels (plus a 5px ramp) get replaced.
+        # A hard-edge paste of the full bbox produces a visible
+        # rectangular seam at the bbox boundary because ProPainter
+        # slightly nudges colour/lighting on unmasked pixels inside
+        # the bbox to maintain temporal consistency.
         emit_progress("overlay", 0.0)
         output.parent.mkdir(parents=True, exist_ok=True)
-        _overlay(decode_source, inpainted_crop, output, cx, cy, ffmpeg)
+        fps = _probe_fps(decode_source, ffprobe) if ffprobe else None
+        if fps and fps > 0:
+            _overlay(
+                decode_source, inpainted_crop, output, cx, cy, ffmpeg,
+                mask_seq_dir=crop_masks, feather_px=5, fps=fps,
+            )
+        else:
+            log.warning(
+                "ffprobe could not determine source fps (%r); falling "
+                "back to hard-edge overlay -- the bbox boundary will "
+                "be visible in the output.", fps,
+            )
+            _overlay(decode_source, inpainted_crop, output, cx, cy, ffmpeg)
         emit_progress("overlay", 1.0)
 
     else:

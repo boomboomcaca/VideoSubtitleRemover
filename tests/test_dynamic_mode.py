@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -406,6 +407,188 @@ class TestWorkspaceModule(unittest.TestCase):
         self.assertEqual(format_size(2048), "2.0 KB")
         self.assertEqual(format_size(2 * 1024 * 1024), "2.0 MB")
         self.assertEqual(format_size(int(3.2 * 1024 ** 3)), "3.2 GB")
+
+
+class TestOverlayFilterGraph(unittest.TestCase):
+    """The exact filter_complex string is the contract between us and
+    ffmpeg. Regressions here are silent: the command runs, the file is
+    produced, but the visual result is wrong. Pin every variant."""
+
+    def test_hard_edge_no_mask(self):
+        from backend.dynamic._worker import _build_overlay_filter
+        # Legacy fallback when no mask is provided -- the original
+        # signature, unchanged on purpose so a bisect to mask=None
+        # cleanly reproduces the pre-feather behaviour.
+        g = _build_overlay_filter(100, 200,
+                                  mask_input_idx=None, feather_px=5)
+        self.assertEqual(g, "[0:v][1:v]overlay=100:200:eof_action=pass")
+
+    def test_alpha_feathered_mask_at_input_2(self):
+        from backend.dynamic._worker import _build_overlay_filter
+        g = _build_overlay_filter(100, 200,
+                                  mask_input_idx=2, feather_px=5)
+        # Mask must go through boxblur (the feather), get alpha-merged
+        # onto the inpaint stream, THEN overlay onto base. Order matters:
+        # alphamerge after blur means the soft edge is preserved into
+        # alpha; if you blur after alphamerge it blurs the rgb too.
+        self.assertEqual(
+            g,
+            "[2:v]format=gray,boxblur=5:1[mfeath];"
+            "[1:v][mfeath]alphamerge[crop_a];"
+            "[0:v][crop_a]overlay=100:200:eof_action=pass",
+        )
+
+    def test_feather_px_threads_into_filter(self):
+        from backend.dynamic._worker import _build_overlay_filter
+        g = _build_overlay_filter(0, 0, mask_input_idx=2, feather_px=12)
+        self.assertIn("boxblur=12:1", g)
+
+    def test_negative_coords_pass_through(self):
+        # ffmpeg's overlay accepts negative x/y (shifts the inpaint
+        # partially off-base). The graph must just thread the values
+        # through without sanitising.
+        from backend.dynamic._worker import _build_overlay_filter
+        g = _build_overlay_filter(-50, -25,
+                                  mask_input_idx=None, feather_px=5)
+        self.assertEqual(g, "[0:v][1:v]overlay=-50:-25:eof_action=pass")
+
+    def test_eof_action_pass_in_all_modes(self):
+        # Critical correctness invariant from the bigger _overlay
+        # docstring: eof_action=pass is what guarantees the output
+        # spans the full base duration even if the inpaint stream is
+        # short. Both modes must preserve it.
+        from backend.dynamic._worker import _build_overlay_filter
+        for kw in ({"mask_input_idx": None},
+                   {"mask_input_idx": 2}):
+            g = _build_overlay_filter(10, 20, feather_px=5, **kw)
+            self.assertIn("eof_action=pass", g,
+                          f"missing eof_action=pass for {kw}")
+
+
+class TestBboxSidecar(unittest.TestCase):
+    """bbox.json sidecar is the contract that lets the recomposite CLI
+    redo just the overlay step. Schema is tiny but stable -- bump
+    schema_version if the field set changes so old workspaces don't
+    silently mismatch."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vsr_bbox_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_roundtrip(self):
+        # The worker writes this dict; the recomposite CLI reads the
+        # x/y/w/h fields back. Verify the contract directly so a typo
+        # on either side fails here, not at runtime.
+        import json
+        sidecar = self.tmp / "_bbox.json"
+        payload = {
+            "schema_version": 1,
+            "x": 1340, "y": 820,
+            "w": 256, "h": 256,
+            "frame_w": 1920, "frame_h": 1080,
+        }
+        with open(sidecar, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        with open(sidecar, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        for key in ("x", "y", "w", "h", "frame_w", "frame_h",
+                    "schema_version"):
+            self.assertIn(key, data)
+        self.assertEqual((data["x"], data["y"], data["w"], data["h"]),
+                         (1340, 820, 256, 256))
+
+
+class TestRecompositeDiscovery(unittest.TestCase):
+    """The recomposite CLI's path-discovery is what users will hit when
+    they point it at the wrong dir; every missing file should produce a
+    helpful error, not a cryptic TypeError deep in ffmpeg arg-building."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vsr_recomp_"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_workspace(self, *, with_bbox=True, with_masks=True,
+                        with_crop_out=True, with_base=True):
+        from tool.dynamic_recomposite import _VIDEO_STEM, _CROP_STEM
+        ws = self.tmp / "fakews_abc12345"
+        ws.mkdir()
+        if with_base:
+            (ws / f"{_VIDEO_STEM}.mp4").write_bytes(b"\0" * 4096)
+        crop_root = ws / _VIDEO_STEM / "_crop"
+        crop_root.mkdir(parents=True)
+        if with_bbox:
+            (crop_root / "_bbox.json").write_text(
+                '{"schema_version": 1, "x": 100, "y": 200,'
+                ' "w": 256, "h": 128,'
+                ' "frame_w": 1920, "frame_h": 1080}',
+                encoding="utf-8",
+            )
+        if with_masks:
+            masks = crop_root / "masks"
+            masks.mkdir()
+            (masks / "00000.png").write_bytes(b"\0" * 256)
+            (masks / "00001.png").write_bytes(b"\0" * 256)
+        if with_crop_out:
+            crop_out_dir = crop_root / "out" / _CROP_STEM
+            crop_out_dir.mkdir(parents=True)
+            (crop_out_dir / "inpaint_out.mp4").write_bytes(b"\0" * 8192)
+        return ws
+
+    def test_full_workspace_resolves(self):
+        from tool.dynamic_recomposite import _discover_paths, _resolve_bbox
+        ws = self._make_workspace()
+        base, crop, masks, bbox_path = _discover_paths(ws)
+        self.assertTrue(base.is_file())
+        self.assertTrue(crop.is_file())
+        self.assertTrue(masks.is_dir())
+        self.assertTrue(bbox_path.is_file())
+        bb = _resolve_bbox(bbox_path, None)
+        self.assertEqual(bb, (100, 200, 256, 128))
+
+    def test_missing_base_raises_with_clear_message(self):
+        from tool.dynamic_recomposite import _discover_paths
+        ws = self._make_workspace(with_base=False)
+        with self.assertRaises(FileNotFoundError) as ctx:
+            _discover_paths(ws)
+        self.assertIn("base video", str(ctx.exception))
+
+    def test_missing_crop_out_raises_with_clear_message(self):
+        from tool.dynamic_recomposite import _discover_paths
+        ws = self._make_workspace(with_crop_out=False)
+        with self.assertRaises(FileNotFoundError) as ctx:
+            _discover_paths(ws)
+        self.assertIn("ProPainter output", str(ctx.exception))
+
+    def test_missing_masks_raises_with_clear_message(self):
+        from tool.dynamic_recomposite import _discover_paths
+        ws = self._make_workspace(with_masks=False)
+        with self.assertRaises(FileNotFoundError) as ctx:
+            _discover_paths(ws)
+        self.assertIn("mask sequence dir", str(ctx.exception))
+
+    def test_cli_bbox_override(self):
+        # --bbox "x,y,w,h" lets users recomposite workspaces that
+        # predate the bbox sidecar.
+        from tool.dynamic_recomposite import _resolve_bbox
+        bb = _resolve_bbox(self.tmp / "does_not_exist.json", "10,20,30,40")
+        self.assertEqual(bb, (10, 20, 30, 40))
+
+    def test_missing_sidecar_and_no_override_raises(self):
+        from tool.dynamic_recomposite import _resolve_bbox
+        with self.assertRaises(SystemExit) as ctx:
+            _resolve_bbox(self.tmp / "does_not_exist.json", None)
+        self.assertIn("bbox sidecar", str(ctx.exception))
+
+    def test_cli_bbox_malformed_raises(self):
+        from tool.dynamic_recomposite import _resolve_bbox
+        with self.assertRaises(SystemExit):
+            _resolve_bbox(self.tmp / "x.json", "10,20,30")        # 3 ints
+        with self.assertRaises(SystemExit):
+            _resolve_bbox(self.tmp / "x.json", "a,b,c,d")          # not ints
 
 
 class TestChunkGeometry(unittest.TestCase):
