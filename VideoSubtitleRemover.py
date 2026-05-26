@@ -334,6 +334,11 @@ class ProcessingConfig:
     adv_panel_open: bool = False
     log_panel_open: bool = True
     onboarding_seen: bool = False
+    # Horizontal split between left (Input & Settings) and right (Queue &
+    # Preview) columns, expressed as the fraction of *flex* width allocated
+    # to the left column (0.0 = right gets all extra space, 1.0 = left
+    # gets all extra). Default 0.57 mirrors the historical 57:43 weights.
+    split_ratio: float = 0.57
 
     def to_dict(self) -> dict:
         return {
@@ -2783,7 +2788,17 @@ class VideoSubtitleRemoverApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        self.root.geometry("1240x860")
+        # Centre the main window on the screen at startup. winfo_screen* are
+        # available before the first mainloop() iteration on every Tk version.
+        init_w, init_h = 1240, 860
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            x = max(0, (sw - init_w) // 2)
+            y = max(0, (sh - init_h) // 2)
+            self.root.geometry(f"{init_w}x{init_h}+{x}+{y}")
+        except Exception:  # noqa: BLE001
+            self.root.geometry(f"{init_w}x{init_h}")
         self.root.minsize(980, 720)
         self.root.configure(bg=Theme.BG_DARK)
 
@@ -2842,6 +2857,9 @@ class VideoSubtitleRemoverApp:
         self._throbber_id = None
         self._throbber_phase = 0
         self._layout_mode = "wide"
+        # Left/right splitter ratio (left column share of total width). 0.57 mirrors
+        # the previous 57:43 weighted grid so the default look is unchanged.
+        self._sash_ratio = 0.57
         self._workflow_pills = []
         self._last_timeline_frames: Dict[str, int] = {}  # remember last timeline frame per queue item id
 
@@ -3383,6 +3401,35 @@ class VideoSubtitleRemoverApp:
             return
         self._apply_responsive_layout(event.width)
 
+    def _capture_sash_ratio(self, _event=None):
+        """Remember the user's drag position so we can restore it later."""
+        if self._layout_mode != "wide" or not hasattr(self, "_paned"):
+            return
+        try:
+            total = self._paned.winfo_width()
+            if total <= 1:
+                return
+            x = self._paned.sash_coord(0)[0]
+            ratio = x / total
+            # Clamp so a stray drag can't fully collapse either side.
+            self._sash_ratio = max(0.2, min(0.85, ratio))
+        except (tk.TclError, IndexError):
+            pass
+
+    def _apply_sash_ratio(self):
+        """Place the splitter at the saved ratio (call after layout settles)."""
+        if self._layout_mode != "wide" or not hasattr(self, "_paned"):
+            return
+        try:
+            total = self._paned.winfo_width()
+            if total <= 100:  # not yet realized; defer
+                return
+            target = int(total * self._sash_ratio)
+            target = max(1, min(total - 1, target))
+            self._paned.sash_place(0, target, 0)
+        except tk.TclError:
+            pass
+
     def _apply_responsive_layout(self, width: int):
         """Stack columns and footer/help clusters on narrower windows."""
         if not hasattr(self, "_content"):
@@ -3398,21 +3445,31 @@ class VideoSubtitleRemoverApp:
                 self.header_guidance_body.config(wraplength=_scaled(self.root, 520 if mode == "stacked" else 300))
             if hasattr(self, "status_hint"):
                 self.status_hint.config(wraplength=_scaled(self.root, 520 if mode == "stacked" else 360))
+            if mode == "wide":
+                # Maintain the user's chosen ratio when the window is resized.
+                self._apply_sash_ratio()
             return
 
         self._layout_mode = mode
         stacked = (mode == "stacked")
 
-        self._left_col.grid_forget()
-        self._right_col.grid_forget()
-
         if stacked:
+            # Pull the columns out of the splitter and stack them via grid.
+            try:
+                for pane in list(self._paned.panes()):
+                    self._paned.forget(pane)
+            except tk.TclError:
+                pass
+            self._paned.grid_forget()
+
             self._content.columnconfigure(0, weight=1, minsize=0)
             self._content.columnconfigure(1, weight=0, minsize=0)
             self._content.rowconfigure(0, weight=0)
             self._content.rowconfigure(1, weight=1)
-            self._left_col.grid(row=0, column=0, sticky="nsew", padx=0, pady=(0, Theme.S_MD))
-            self._right_col.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
+            self._left_col.grid(in_=self._content, row=0, column=0,
+                                sticky="nsew", padx=0, pady=(0, Theme.S_MD))
+            self._right_col.grid(in_=self._content, row=1, column=0,
+                                 sticky="nsew", padx=0, pady=0)
 
             self._header_right.pack_forget()
             self._header_right.pack(fill="x", pady=(Theme.S_LG, 0))
@@ -3428,12 +3485,29 @@ class VideoSubtitleRemoverApp:
             self.status_hint.pack_forget()
             self.status_hint.pack(fill="x", pady=(Theme.S_XS, 0))
         else:
-            self._content.columnconfigure(0, weight=57, minsize=440)
-            self._content.columnconfigure(1, weight=43, minsize=360)
+            # Restore the resizable splitter view.
+            self._left_col.grid_forget()
+            self._right_col.grid_forget()
+
+            self._content.columnconfigure(0, weight=1, minsize=0)
+            self._content.columnconfigure(1, weight=0, minsize=0)
             self._content.rowconfigure(0, weight=1)
             self._content.rowconfigure(1, weight=0)
-            self._left_col.grid(row=0, column=0, sticky="nsew", padx=(0, Theme.S_MD))
-            self._right_col.grid(row=0, column=1, sticky="nsew", padx=(Theme.S_MD, 0))
+            self._paned.grid(row=0, column=0, sticky="nsew")
+
+            existing_panes = []
+            try:
+                existing_panes = [str(p) for p in self._paned.panes()]
+            except tk.TclError:
+                pass
+            if str(self._left_col) not in existing_panes:
+                self._paned.add(self._left_col, minsize=440, stretch="always",
+                                padx=0, pady=0)
+            if str(self._right_col) not in existing_panes:
+                self._paned.add(self._right_col, minsize=360, stretch="always",
+                                padx=0, pady=0)
+            # Defer until Tk finishes laying out the freshly added panes.
+            self.root.after(0, self._apply_sash_ratio)
 
             self._header_right.pack_forget()
             self._header_right.pack(side="right", anchor="n")
@@ -3579,18 +3653,35 @@ class VideoSubtitleRemoverApp:
         # Header
         self._build_header(main_container)
 
-        # Content area (two columns via grid)
+        # Content area: resizable splitter between input/settings (left) and queue/preview (right).
         content = tk.Frame(main_container, bg=Theme.BG_DARK)
         content.pack(fill="both", expand=True, pady=(Theme.S_MD, 0))
-        content.columnconfigure(0, weight=57, minsize=440)
-        content.columnconfigure(1, weight=43, minsize=360)
+        content.columnconfigure(0, weight=1)
         content.rowconfigure(0, weight=1)
+        self._content = content
+
+        # The PanedWindow background colour is what shows in the sash gap, so we
+        # use BORDER to render it as a thin visible divider. Tk auto-switches the
+        # cursor to a horizontal resize arrow when hovering the sash.
+        self._paned = tk.PanedWindow(
+            content,
+            orient=tk.HORIZONTAL,
+            bg=Theme.BORDER,
+            sashwidth=6,
+            sashrelief="flat",
+            sashpad=0,
+            borderwidth=0,
+            opaqueresize=True,
+            showhandle=False,
+        )
+        self._paned.grid(row=0, column=0, sticky="nsew")
+        self._paned.bind("<ButtonRelease-1>", self._capture_sash_ratio)
 
         # Left column - Input & Settings (Scrollable Container)
-        left_col_container = tk.Frame(content, bg=Theme.BG_DARK)
-        left_col_container.grid(row=0, column=0, sticky="nsew", padx=(0, Theme.S_MD))
-        self._content = content
+        left_col_container = tk.Frame(self._paned, bg=Theme.BG_DARK)
         self._left_col = left_col_container
+        self._paned.add(left_col_container, minsize=440, stretch="always",
+                        padx=0, pady=0)
 
         self.left_canvas = tk.Canvas(left_col_container, bg=Theme.BG_DARK, highlightthickness=0)
         left_scrollbar = ttk.Scrollbar(left_col_container, orient="vertical",
@@ -3623,11 +3714,15 @@ class VideoSubtitleRemoverApp:
         self.left_canvas.bind("<Leave>", lambda e: self.left_canvas.unbind("<MouseWheel>"))
 
         # Right column - Queue & Preview
-        right_col = tk.Frame(content, bg=Theme.BG_DARK)
-        right_col.grid(row=0, column=1, sticky="nsew", padx=(Theme.S_MD, 0))
+        right_col = tk.Frame(self._paned, bg=Theme.BG_DARK)
         self._right_col = right_col
+        self._paned.add(right_col, minsize=360, stretch="always",
+                        padx=0, pady=0)
 
         self._build_queue_section(right_col)
+
+        # Restore the saved sash ratio once the panes have been laid out.
+        self.root.after(0, self._apply_sash_ratio)
 
         # Log panel
         self._build_log_panel(main_container)
@@ -6495,7 +6590,22 @@ class VideoSubtitleRemoverApp:
         init_w = max(disp_w, _scaled(self.root, 580))
         extra_h = 170 if total_frames > 1 else 125
         init_h = disp_h + _scaled(self.root, extra_h)
-        win.geometry(f"{init_w}x{init_h}")
+
+        # Centre on the parent window (matches the progress / batch-summary
+        # dialogs). Clamp inside the visible screen so a tall frame can't push
+        # the window off-screen on small displays or multi-monitor setups.
+        try:
+            self.root.update_idletasks()
+            px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
+            pw, ph = self.root.winfo_width(), self.root.winfo_height()
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            x = px + max(0, (pw - init_w) // 2)
+            y = py + max(0, (ph - init_h) // 2)
+            x = max(0, min(x, sw - init_w))
+            y = max(0, min(y, sh - init_h))
+            win.geometry(f"{init_w}x{init_h}+{x}+{y}")
+        except Exception:  # noqa: BLE001
+            win.geometry(f"{init_w}x{init_h}")
         win.minsize(init_w, init_h)
 
         # Disable transient to restore native Windows Maximize/Minimize buttons and title bar double-click behavior
@@ -7822,20 +7932,39 @@ class VideoSubtitleRemoverApp:
                 if pos_part:
                     x_s, _, y_s = pos_part.partition('+')
                     x = int(x_s); y = int(y_s)
+                    # Clamp window dimensions to screen size
+                    w = min(w, screen_w)
+                    h = min(h, screen_h)
                     # Reject off-screen saved positions
                     if (x < -80 or y < -40
                             or x + 120 > screen_w or y + 80 > screen_h):
                         raise ValueError("off-screen")
+                    # Ensure the window does not overflow screen boundaries
+                    if x + w > screen_w:
+                        x = max(0, screen_w - w)
+                    if y + h > screen_h:
+                        y = max(0, screen_h - h)
                     self.root.geometry(f"{w}x{h}+{x}+{y}")
                 else:
+                    w = min(w, screen_w)
+                    h = min(h, screen_h)
                     self.root.geometry(f"{w}x{h}")
                 restored = True
             except Exception:
                 restored = False
 
         if not restored:
-            width = min(self.root.winfo_width(), max(960, screen_w - 120))
-            height = min(self.root.winfo_height(), max(720, screen_h - 120))
+            try:
+                geom = self.root.geometry()
+                size_part, _, _ = geom.partition('+')
+                w_s, _, h_s = size_part.partition('x')
+                cfg_w = int(w_s)
+                cfg_h = int(h_s)
+            except Exception:
+                cfg_w, cfg_h = 1240, 860
+
+            width = min(cfg_w, max(960, screen_w - 120))
+            height = min(cfg_h, max(720, screen_h - 120))
             x = max(24, (screen_w // 2) - (width // 2))
             y = max(24, (screen_h // 2) - (height // 2))
             self.root.geometry(f"{width}x{height}+{x}+{y}")
