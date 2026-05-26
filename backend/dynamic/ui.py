@@ -323,6 +323,15 @@ class DynamicWatermarkWindow(tk.Toplevel):
         self.minsize(900, 640)
         self.configure(bg=self._theme.BG_DARK)
 
+        # Centre on screen (clamp so window never extends off-screen)
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w, h = 1100, 780
+        x = max(0, min((sw - w) // 2, sw - w))
+        y = max(0, min((sh - h) // 2, sh - h))
+        self.geometry(f"+{x}+{y}")
+
         # State
         self._video_path: Optional[Path] = None
         self._output_path: Optional[Path] = None
@@ -702,6 +711,7 @@ class DynamicWatermarkWindow(tk.Toplevel):
                 wm_path=wm_path,
                 auto_crop=auto_crop,
                 fp16=fp16,
+                mask_dilate=12,
                 progress_callback=cb,
             )
             self.after(0, lambda: self._on_success(result))

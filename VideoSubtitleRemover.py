@@ -1187,6 +1187,40 @@ def _scaled(root, px: int) -> int:
     return int(px * _get_dpi_scale(root))
 
 
+def _center_window_on_screen(window, width: int = 0, height: int = 0) -> None:
+    """Position *window* at the centre of the screen it lives on.
+
+    Pass explicit width/height to also resize the window; otherwise the
+    window's requested size is used and only its position is set.
+    Falls back to a centered position-only ``geometry()`` call if anything
+    goes wrong (e.g. the window has been destroyed mid-call).
+    """
+    try:
+        window.update_idletasks()
+        w = int(width) if width else window.winfo_reqwidth()
+        h = int(height) if height else window.winfo_reqheight()
+        sw = window.winfo_screenwidth()
+        sh = window.winfo_screenheight()
+        # Clamp so window never extends beyond screen edges.
+        x = max(0, min((sw - w) // 2, sw - w))
+        y = max(0, min((sh - h) // 2, sh - h))
+        if width or height:
+            window.geometry(f"{w}x{h}+{x}+{y}")
+        else:
+            window.geometry(f"+{x}+{y}")
+    except Exception:  # noqa: BLE001
+        if width or height:
+            try:
+                # Fallback: try centered sizing without position
+                x = max(0, min((window.winfo_screenwidth() - int(width)) // 2,
+                               window.winfo_screenwidth() - int(width)))
+                y = max(0, min((window.winfo_screenheight() - int(height)) // 2,
+                               window.winfo_screenheight() - int(height)))
+                window.geometry(f"{int(width)}x{int(height)}+{x}+{y}")
+            except Exception:  # noqa: BLE001
+                pass
+
+
 class Tooltip:
     """Refined hover tooltip. Appears after a short delay, styled as a raised
     surface with subtle border and proper text wrapping."""
@@ -1907,20 +1941,7 @@ def show_confirm(parent, title: str, message: str, detail: str = "",
     dialog.bind("<Return>", lambda e: _confirm())
     dialog.protocol("WM_DELETE_WINDOW", _cancel)
 
-    # Center on parent
-    dialog.update_idletasks()
-    try:
-        px = parent.winfo_rootx()
-        py = parent.winfo_rooty()
-        pw = parent.winfo_width()
-        ph = parent.winfo_height()
-        dw = dialog.winfo_reqwidth()
-        dh = dialog.winfo_reqheight()
-        x = px + (pw - dw) // 2
-        y = py + (ph - dh) // 3
-        dialog.geometry(f"+{x}+{y}")
-    except Exception:
-        pass
+    _center_window_on_screen(dialog)
 
     dialog.deiconify()
     dialog.grab_set()
@@ -3419,8 +3440,20 @@ class VideoSubtitleRemoverApp:
         # state so _on_close can persist a useful position even if the user
         # quits while the window is maximized.
         try:
-            if self.root.state() not in ("zoomed", "iconic"):
+            state = self.root.state()
+            if state not in ("zoomed", "iconic"):
                 self._last_normal_geometry = self.root.geometry()
+                # Real-time sync: window left maximized state, keep in-memory
+                # flag in sync so any abnormal exit still has a recent value.
+                if getattr(self, "_config_synced_maximized", False):
+                    self.config.window_maximized = False
+                    self._config_synced_maximized = False
+            else:
+                # Window just became maximized — update flag immediately so an
+                # abnormal termination (no _on_close) still has the right state.
+                if not getattr(self, "_config_synced_maximized", False):
+                    self.config.window_maximized = True
+                    self._config_synced_maximized = True
         except tk.TclError:
             pass
         self._apply_responsive_layout(event.width)
@@ -5100,17 +5133,7 @@ class VideoSubtitleRemoverApp:
         dialog.bind("<Return>", lambda e: _submit())
         dialog.protocol("WM_DELETE_WINDOW", _cancel)
 
-        dialog.update_idletasks()
-        try:
-            px = self.root.winfo_rootx()
-            py = self.root.winfo_rooty()
-            pw = self.root.winfo_width()
-            ph = self.root.winfo_height()
-            dw = dialog.winfo_reqwidth()
-            dh = dialog.winfo_reqheight()
-            dialog.geometry(f"+{px + (pw - dw) // 2}+{py + (ph - dh) // 3}")
-        except Exception:
-            pass
+        _center_window_on_screen(dialog)
 
         dialog.deiconify()
         dialog.grab_set()
@@ -5260,14 +5283,7 @@ class VideoSubtitleRemoverApp:
         dialog.bind("<Return>", lambda e: _close())
         dialog.protocol("WM_DELETE_WINDOW", _close)
 
-        dialog.update_idletasks()
-        try:
-            px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
-            pw, ph = self.root.winfo_width(), self.root.winfo_height()
-            dw, dh = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
-            dialog.geometry(f"+{px + (pw - dw) // 2}+{py + (ph - dh) // 3}")
-        except Exception:
-            pass
+        _center_window_on_screen(dialog)
         dialog.deiconify()
         dialog.grab_set()
 
@@ -5342,14 +5358,7 @@ class VideoSubtitleRemoverApp:
 
         win.bind("<Escape>", lambda e: win.destroy())
         win.update_idletasks()
-        try:
-            w = win.winfo_reqwidth()
-            h = win.winfo_reqheight()
-            x = (screen_w - w) // 2
-            y = max(20, (screen_h - h) // 2)
-            win.geometry(f"+{x}+{y}")
-        except Exception:
-            pass
+        _center_window_on_screen(win)
         win.deiconify()
 
     def _show_batch_summary(self, complete: int, errors: int,
@@ -5500,14 +5509,7 @@ class VideoSubtitleRemoverApp:
         dialog.bind("<Return>", lambda e: _close())
         dialog.protocol("WM_DELETE_WINDOW", _close)
 
-        dialog.update_idletasks()
-        try:
-            px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
-            pw, ph = self.root.winfo_width(), self.root.winfo_height()
-            dw, dh = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
-            dialog.geometry(f"+{px + (pw - dw) // 2}+{py + (ph - dh) // 3}")
-        except Exception:
-            pass
+        _center_window_on_screen(dialog)
         dialog.deiconify()
         dialog.grab_set()
 
@@ -5622,6 +5624,11 @@ class VideoSubtitleRemoverApp:
         prog_win.transient(self.root)
         prog_win.resizable(True, True)
 
+        # Hide first so Tk fully realises the widget before we centre it.
+        # Without this, winfo_screenwidth/height can return wrong values
+        # on multi-monitor / HiDPI setups (window hasn't been mapped yet).
+        prog_win.withdraw()
+
         # Pack the button row FIRST with side='bottom' so it always
         # claims its strip at the bottom of the window, regardless of
         # how much vertical space the status label + progress bar end
@@ -5701,7 +5708,8 @@ class VideoSubtitleRemoverApp:
                     output=out, wm_path=wm_path,
                     auto_crop=True, fp16=True,
                     subvideo_length=160,
-                    crop_padding=48,
+                    crop_padding=96,      # Increased for better watermark coverage
+                    mask_dilate=12,       # Increased for anti-aliased/outline edges
                     progress_callback=_set_progress,
                 )
                 self.root.after(0, lambda: _done(result.output_video))
@@ -5741,17 +5749,10 @@ class VideoSubtitleRemoverApp:
         # Now that everything is laid out, let Tk compute the required
         # size and centre on the parent. Pin a minimum width so a short
         # filename doesn't produce a tiny dialog.
-        prog_win.update_idletasks()
         req_w = max(prog_win.winfo_reqwidth(), _scaled(self.root, 560))
         req_h = max(prog_win.winfo_reqheight(), _scaled(self.root, 180))
-        try:
-            px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
-            pw, ph = self.root.winfo_width(), self.root.winfo_height()
-            x = px + max(0, (pw - req_w) // 2)
-            y = py + max(0, (ph - req_h) // 3)
-            prog_win.geometry(f"{req_w}x{req_h}+{x}+{y}")
-        except Exception:  # noqa: BLE001
-            prog_win.geometry(f"{req_w}x{req_h}")
+        _center_window_on_screen(prog_win, req_w, req_h)
+        prog_win.deiconify()
 
         threading.Thread(target=_bg, daemon=True).start()
 
@@ -5867,17 +5868,9 @@ class VideoSubtitleRemoverApp:
         # Now that everything is laid out, let Tk compute the required
         # size and centre on the parent. Cap to a reasonable max in case
         # the user's font scaling makes the dialog absurdly tall.
-        dlg.update_idletasks()
         req_w = max(dlg.winfo_reqwidth(), _scaled(self.root, 580))
         req_h = max(dlg.winfo_reqheight(), _scaled(self.root, 360))
-        try:
-            px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
-            pw, ph = self.root.winfo_width(), self.root.winfo_height()
-            x = px + max(0, (pw - req_w) // 2)
-            y = py + max(0, (ph - req_h) // 3)
-            dlg.geometry(f"{req_w}x{req_h}+{x}+{y}")
-        except Exception:  # noqa: BLE001
-            dlg.geometry(f"{req_w}x{req_h}")
+        _center_window_on_screen(dlg, req_w, req_h)
 
         dlg.protocol("WM_DELETE_WINDOW", lambda: _pick("cancel"))
         dlg.bind("<Escape>", lambda _e: _pick("cancel"))
@@ -5960,14 +5953,7 @@ class VideoSubtitleRemoverApp:
 
         dialog.bind("<Escape>", lambda e: dialog.destroy())
 
-        dialog.update_idletasks()
-        try:
-            px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
-            pw, ph = self.root.winfo_width(), self.root.winfo_height()
-            dw, dh = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
-            dialog.geometry(f"+{px + (pw - dw) // 2}+{py + (ph - dh) // 3}")
-        except Exception:
-            pass
+        _center_window_on_screen(dialog)
         dialog.deiconify()
         dialog.grab_set()
 
@@ -6615,18 +6601,17 @@ class VideoSubtitleRemoverApp:
         extra_h = 170 if total_frames > 1 else 125
         init_h = disp_h + _scaled(self.root, extra_h)
 
-        # Centre on the parent window (matches the progress / batch-summary
-        # dialogs). Clamp inside the visible screen so a tall frame can't push
-        # the window off-screen on small displays or multi-monitor setups.
+        # Centre on the screen the main window lives on (not the hidden
+        # Toplevel's screen dimensions, which default to primary on Windows
+        # before deiconify). Use parent-relative math directly so the frame
+        # browser appears near the main window on multi-monitor setups.
         try:
             self.root.update_idletasks()
             px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
             pw, ph = self.root.winfo_width(), self.root.winfo_height()
             sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-            x = px + max(0, (pw - init_w) // 2)
-            y = py + max(0, (ph - init_h) // 2)
-            x = max(0, min(x, sw - init_w))
-            y = max(0, min(y, sh - init_h))
+            x = max(0, min(px + (pw - init_w) // 2, sw - init_w))
+            y = max(0, min(py + (ph - init_h) // 2, sh - init_h))
             win.geometry(f"{init_w}x{init_h}+{x}+{y}")
         except Exception:  # noqa: BLE001
             win.geometry(f"{init_w}x{init_h}")

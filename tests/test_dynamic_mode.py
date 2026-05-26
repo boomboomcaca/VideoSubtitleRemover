@@ -26,6 +26,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Tuple
 
 
 def _has_display() -> bool:
@@ -794,28 +795,59 @@ class TestComputeBbox(unittest.TestCase):
             arr[y0:y0 + 40, x0:x0 + 40] = 255
             Image.fromarray(arr).save(d / f"{i:05d}.png")
 
+    @staticmethod
+    def _compute_expected_bbox(align: int) -> Tuple[int, int, int, int]:
+        """Compute expected aligned bbox for the test mask layout.
+
+        Test mask layout: 5 squares (40x40 each), positions:
+          x0 in {100,120,140,160,180} -> [x0, x0+40) -> max x = 219
+          y0 in {80,95,110,125,140} -> [y0, y0+40) -> max y = 179
+
+        Raw union: x: [100, 219], y: [80, 179] -> w=120, h=100
+        With padding=0, align=*:
+          w_aligned = floor(120/align)*align
+          if w_aligned < 120 and can grow: w_aligned += align
+          h_aligned = floor(100/align)*align
+          if h_aligned < 100 and can grow: h_aligned += align
+        """
+        w, h = 120, 100
+        w_aligned = (w // align) * align
+        h_aligned = (h // align) * align
+        # Can grow if fits inside frame (640x480)
+        if w_aligned < w and 100 + w_aligned <= 640:
+            w_aligned += align
+        if h_aligned < h and 80 + h_aligned <= 480:
+            h_aligned += align
+        return (100, 80, w_aligned, h_aligned)
+
     def test_unions_motion(self):
         from backend.dynamic._worker import _compute_bbox
-        bbox = _compute_bbox(self.tmp / "masks", frame_w=640, frame_h=480, padding=0)
-        # 5 squares, each 40x40, moving by (+20, +15) per frame:
-        #   x0 in {100,120,140,160,180}, square spans [x0, x0+40)
-        #   y0 in {80,95,110,125,140},   square spans [y0, y0+40)
-        # Pixel-inclusive union extent:
-        #   x: 100..219 (width = 120)
-        #   y: 80..179  (height = 100)
-        # Worker snaps to multiples of 8:
-        #   width 120 already 0 mod 8, stays 120.
-        #   height 100 -> floor(100/8)*8 = 96; grow to 104 if it still
-        #   fits inside the frame (it does), so final 104.
-        self.assertEqual(bbox, (100, 80, 120, 104))
+        # Test with align=16 (current default)
+        expected = self._compute_expected_bbox(align=16)
+        bbox = _compute_bbox(self.tmp / "masks", frame_w=640, frame_h=480, padding=0, align=16)
+        self.assertEqual(bbox, expected)
+
+    def test_alignment_multiples(self):
+        """Parameterised test: verify bbox dimensions are multiples of align."""
+        from backend.dynamic._worker import _compute_bbox
+        for align in (8, 16, 32):
+            bbox = _compute_bbox(self.tmp / "masks", frame_w=640, frame_h=480, padding=0, align=align)
+            self.assertIsNotNone(bbox)
+            x, y, w, h = bbox
+            with self.subTest(align=align):
+                self.assertEqual(w % align, 0, f"width {w} not divisible by {align}")
+                self.assertEqual(h % align, 0, f"height {h} not divisible by {align}")
+                # Verify it matches the computed expected value
+                expected = self._compute_expected_bbox(align)
+                self.assertEqual(bbox, expected)
 
     def test_pads_and_aligns(self):
         from backend.dynamic._worker import _compute_bbox
-        bbox = _compute_bbox(self.tmp / "masks", frame_w=640, frame_h=480, padding=10)
+        bbox = _compute_bbox(self.tmp / "masks", frame_w=640, frame_h=480, padding=10, align=16)
         self.assertIsNotNone(bbox)
         x, y, w, h = bbox
-        self.assertEqual(w % 8, 0)
-        self.assertEqual(h % 8, 0)
+        self.assertEqual(w % 16, 0)
+        self.assertEqual(h % 16, 0)
         # Padded bbox must contain the unpadded inclusive extent
         # x in [100, 220), y in [80, 180).
         self.assertLessEqual(x, 100)

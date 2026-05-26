@@ -250,6 +250,7 @@ def run_dynamic_removal(
     aot_model: str = "r50_deaotl",
     auto_crop: bool = True,
     crop_padding: int = 96,
+    mask_dilate: int = 12,
     keep_intermediates: bool = False,
     stream_to_stderr: bool = True,
     progress_callback: Optional[ProgressCallback] = None,
@@ -293,6 +294,13 @@ def run_dynamic_removal(
         more surrounding texture to learn from but increases VRAM /
         wall-time cost. Default 96 is a good balance for logo-sized
         watermarks.
+    mask_dilate
+        Pixels to grow each cleaned mask outward (default 12). 0 disables
+        the step. Watermarks with sharp circular outlines or anti-
+        aliased glyphs leak ~1-3 px past whatever SAM segments; without
+        dilation those ring pixels stay un-masked and survive inpainting
+        as a faint halo. 4-8 is the sweet spot for "logo with stroke";
+        bump to 10-12 only if the residue persists after a 12 px run.
 
     Returns
     -------
@@ -364,6 +372,7 @@ def run_dynamic_removal(
         "fp16": bool(fp16),
         "auto_crop": bool(auto_crop),
         "crop_padding": int(crop_padding),
+        "mask_dilate": max(0, int(mask_dilate)),
         "workspace": str(workspace),
     }
 

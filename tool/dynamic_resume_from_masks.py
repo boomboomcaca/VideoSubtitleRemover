@@ -108,6 +108,7 @@ def main(argv=None) -> int:
             mask_dir, frame_w, frame_h, padding=args.crop_padding,
             cached_union=cached_union,
             cached_n_with_content=n_with_content,
+            align=8,
         )
         if bbox is None:
             log.warning("Empty mask -- disabling auto-crop")

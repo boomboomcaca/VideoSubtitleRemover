@@ -158,6 +158,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         "when --auto-crop is on (default 96). More "
                         "padding = more surrounding texture for "
                         "ProPainter, but larger crop and slower run.")
+    p.add_argument("--mask-dilate", type=int, default=12,
+                   help="Pixels to grow each mask outward before saving "
+                        "(default 12). 0 disables. Increases to 4-8 px "
+                        "eliminate the faint outline ring that sharp-edge "
+                        "watermarks leave in the inpaint output.")
     fp = p.add_mutually_exclusive_group()
     fp.add_argument("--fp16", dest="fp16", action="store_true", default=True,
                     help="Use FP16 in ProPainter (default, halves VRAM).")
@@ -213,6 +218,7 @@ def main(argv=None) -> int:
             aot_model=args.aot_model,
             auto_crop=args.auto_crop,
             crop_padding=args.crop_padding,
+            mask_dilate=args.mask_dilate,
             keep_intermediates=args.keep_intermediates,
             progress_callback=_make_progress_reporter() if args.progress else None,
         )

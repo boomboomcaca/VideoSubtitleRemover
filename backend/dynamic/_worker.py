@@ -418,17 +418,29 @@ class FfmpegVideoReader:
 # Mask processing
 # --------------------------------------------------------------------------- #
 
-def _clean_one_mask_worker(args):
+def _clean_one_mask_worker(
+    args: Tuple[str, float, float, int],
+) -> Tuple[int, bool, Optional[Tuple[int, int, int, int]]]:
     """Per-frame mask cleanup; runs inside a ProcessPoolExecutor child.
 
     Module-level so it pickles cleanly across processes on Windows. Re-
     imports its dependencies lazily because each child reaches this
     function before the parent's main() block has run any heavy imports.
 
-    Returns ``(max_object_id_seen, was_drifted)`` -- the parent
+    ``args`` is ``(png_path, ref_cx, ref_cy, dilate_px)`` where
+    ``dilate_px`` is how many pixels to grow the cleaned mask outward
+    before saving (handles anti-aliased / soft watermark edges that the
+    raw SAM mask under-covers, leaving 1-3 px halos in the inpaint
+    output). 0 disables dilation.
+
+    Returns ``(max_object_id_seen, was_drifted, bbox)`` -- the parent
     aggregates these to keep the existing log line accurate.
     """
-    png_path, ref_cx, ref_cy = args
+    png_path: str
+    ref_cx: float
+    ref_cy: float
+    dilate_px: int
+    png_path, ref_cx, ref_cy, dilate_px = args
 
     import numpy as np
     from PIL import Image
@@ -486,6 +498,30 @@ def _clean_one_mask_worker(args):
                     drift = True
                 binary = kept
 
+    # Optional outward dilation (capped at 20px to prevent excessive growth).
+    # Watermarks with crisp circular outlines or anti-aliased glyph edges
+    # leak 1-3 px past whatever SAM segments as "the watermark", and
+    # ProPainter has no chance of reconstructing those edge pixels because
+    # they sit OUTSIDE the mask -- the user sees a faint halo / outline
+    # ring in the cleaned video. Growing the mask by a handful of pixels
+    # swallows the soft edge at the cost of asking ProPainter to fill a
+    # slightly larger area (no measurable quality drop on the 4-12 px
+    # range we care about).
+    if dilate_px > 0 and binary.any():
+        # Clamp to reasonable maximum to prevent pathological ksize values.
+        safe_dilate = min(dilate_px, 20)
+        ksize = 2 * safe_dilate + 1
+        if backend == "cv2":
+            kernel = _cv2.getStructuringElement(
+                _cv2.MORPH_ELLIPSE, (ksize, ksize))
+            binary = _cv2.dilate(binary, kernel, iterations=1)
+        elif backend == "scipy":
+            from scipy.ndimage import binary_dilation
+            binary = binary_dilation(
+                binary, iterations=safe_dilate).astype(np.uint8)
+        # backend == "none" -> skip silently; warning already emitted
+        # in the parent when cv2/scipy were both missing.
+
     # Compute the bbox of the final binary mask. The parent aggregates
     # these into a union bbox during the cleanup pass, eliminating the
     # need for a second full scan in _compute_bbox -- saves ~10-15 min
@@ -500,11 +536,13 @@ def _clean_one_mask_worker(args):
         bbox = None
 
     # Fast path: skip the rewrite when the input PNG is already in the
-    # canonical {0, 255} binary form AND no drift CC was filtered. This
-    # is the common case on resume runs (e.g. dynamic_resume_from_masks)
-    # where a previous pass already cleaned the masks -- avoids re-zlib-
-    # encoding ~100K files for no behavioural change.
-    if not drift and max_obj == 255 and binary.any():
+    # canonical {0, 255} binary form AND no drift CC was filtered AND
+    # no dilation is requested (dilation always changes pixel data, so
+    # we must rewrite). This is the common case on resume runs (e.g.
+    # dynamic_resume_from_masks) where a previous pass already cleaned
+    # the masks -- avoids re-zlib-encoding ~100K files for no
+    # behavioural change.
+    if not drift and max_obj == 255 and binary.any() and dilate_px == 0:
         # All non-zero pixels must be exactly 255 (no stray palette
         # indices like {0, 1, 255}); cheaper than np.unique.
         if int(arr[arr > 0].min()) == 255:
@@ -518,7 +556,7 @@ def _clean_one_mask_worker(args):
     return max_obj, drift, bbox
 
 
-def _clean_segtracker_masks(mask_dir: Path):
+def _clean_segtracker_masks(mask_dir: Path, dilate_px: Optional[int] = None):
     """Sanitise the raw mask sequence SegTracker wrote.
 
     1. Move ``*_new.png`` files (auxiliary "newly discovered object"
@@ -532,6 +570,12 @@ def _clean_segtracker_masks(mask_dir: Path):
        finds new things in the scene, and by the end of a typical clip
        99% of pixels are flagged as some tracked object. We only want
        the watermark the user clicked.
+    3. Optionally dilate each cleaned mask outward by ``dilate_px``
+       pixels (default 0). Watermarks with sharp circular outlines or
+       anti-aliased glyphs leak ~1-3 px past whatever SAM segments;
+       without dilation those ring pixels stay un-masked and survive
+       inpainting as a faint halo. 4-8 px is the sweet spot for the
+       common "logo with stroke" cases.
 
     Per-frame work runs in a ProcessPoolExecutor pool because each
     frame's cleanup is independent given the reference centroid; on a
@@ -550,6 +594,9 @@ def _clean_segtracker_masks(mask_dir: Path):
     from PIL import Image
     from concurrent.futures import ProcessPoolExecutor
 
+    # Normalise so callers can pass None for the default of 0.
+    dilate_px = max(0, int(dilate_px)) if dilate_px is not None else 0
+
     # Sidecar fast-path: a previous successful cleanup writes a tiny
     # JSON summary next to the mask dir; if it's present and the PNG
     # count still matches, the entire cleanup pass (~5-10 min on a
@@ -561,15 +608,23 @@ def _clean_segtracker_masks(mask_dir: Path):
             if data.get("schema_version") == 1:
                 cached_n = int(data["n_masks"])
                 current_n = sum(1 for _ in mask_dir.glob("*.png"))
-                if current_n == cached_n and current_n > 0:
+                cached_dilate = int(data.get("dilate_px", 0))
+                if current_n == cached_n and current_n > 0 and cached_dilate == dilate_px:
                     bb = data.get("union_bbox")
                     bb = tuple(bb) if bb is not None else None
                     nwc = int(data.get("n_with_content", 0))
                     log.info(
-                        "Cleanup sidecar matches (%d masks); SKIPPING "
-                        "the entire cleanup pass.", cached_n,
+                        "Cleanup sidecar matches (%d masks, dilate=%d); "
+                        "SKIPPING the entire cleanup pass.",
+                        cached_n, cached_dilate,
                     )
                     return cached_n, bb, nwc
+                elif cached_dilate != dilate_px:
+                    log.info(
+                        "Cleanup sidecar present but dilate_px changed "
+                        "(%d cached vs %d requested); re-running cleanup.",
+                        cached_dilate, dilate_px,
+                    )
                 else:
                     log.info(
                         "Cleanup sidecar present but mask count drifted "
@@ -641,7 +696,7 @@ def _clean_segtracker_masks(mask_dir: Path):
     # tens of thousands of small PNGs. chunksize=64 amortises the
     # spawn/pickle round-trip across a sensible batch.
     n_workers = max(2, min(16, (os.cpu_count() or 4)))
-    args_iter = [(str(p), ref_cx, ref_cy) for p in png_files]
+    args_iter = [(str(p), ref_cx, ref_cy, int(dilate_px)) for p in png_files]
 
     rewritten = 0
     max_obj_seen = 0
@@ -696,6 +751,7 @@ def _clean_segtracker_masks(mask_dir: Path):
             "n_masks": rewritten,
             "union_bbox": list(union_bbox) if union_bbox is not None else None,
             "n_with_content": n_with_content,
+            "dilate_px": dilate_px,
         }
         tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -711,7 +767,7 @@ def _compute_bbox(
     frame_w: int,
     frame_h: int,
     padding: int,
-    align: int = 8,
+    align: int = 16,
     cached_union: Optional[Tuple[int, int, int, int]] = None,
     cached_n_with_content: Optional[int] = None,
 ) -> Optional[Tuple[int, int, int, int]]:
@@ -719,8 +775,9 @@ def _compute_bbox(
 
     Returns ``(x, y, w, h)`` clamped to the video frame and snapped so
     that ``w`` and ``h`` are multiples of *align* (ProPainter resizes
-    inputs to multiples of 8 internally, so giving it an already-aligned
-    crop avoids a one-pixel resize artifact at the overlay boundary).
+    inputs to multiples of 8 internally, but imageio's ffmpeg writer
+    resizes outputs to multiples of 16 for H.264 macroblock compatibility;
+    using 16-alignment prevents frame mismatch at the overlay boundary).
 
     Returns None if every mask is empty (no work to do).
 
@@ -1819,6 +1876,13 @@ def main() -> int:
     fp16 = bool(cfg.get("fp16", True))
     auto_crop = bool(cfg.get("auto_crop", True))
     crop_padding = int(cfg.get("crop_padding", 96))
+    # Pixels to grow each cleaned mask outward before saving. 0 = legacy
+    # behaviour (mask matches what SAM/DeAOT segmented exactly). 4-8 px
+    # eliminates the 1-3 px halo / outline ring that crisp-edged
+    # watermarks (rounded logos, stroked glyphs) leave behind in the
+    # inpaint output. >12 px bloats the auto-crop bbox without measurable
+    # quality gain.
+    mask_dilate = max(0, int(cfg.get("mask_dilate", 12)))
     workspace_str = cfg.get("workspace")
     workspace = Path(workspace_str).resolve() if workspace_str else None
 
@@ -1921,7 +1985,11 @@ def main() -> int:
     # raw union bbox + count of non-empty frames, so Stage 4 can skip
     # its full mask-dir rescan -- saving ~10-15 min on a 98K-mask video.
     emit_progress("mask_cleanup", 0.0)
-    n_masks, cached_union, n_with_content = _clean_segtracker_masks(mask_dir)
+    if mask_dilate > 0:
+        log.info("Mask cleanup will dilate each mask outward by %d px "
+                 "to swallow anti-aliased / outline edges", mask_dilate)
+    n_masks, cached_union, n_with_content = _clean_segtracker_masks(
+        mask_dir, dilate_px=mask_dilate)
     log.info("Cleaned mask directory: %d PNGs ready for ProPainter", n_masks)
     emit_progress("mask_cleanup", 1.0, str(n_masks))
 
