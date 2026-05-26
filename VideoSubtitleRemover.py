@@ -331,6 +331,7 @@ class ProcessingConfig:
 
     # UI state (persisted across sessions; not part of processing config)
     window_geometry: str = ""  # e.g. "1240x860+100+60"
+    window_maximized: bool = False  # True when the window was closed while maximized
     adv_panel_open: bool = False
     log_panel_open: bool = True
     onboarding_seen: bool = False
@@ -388,6 +389,7 @@ class ProcessingConfig:
             "colour_tune_tolerance": self.colour_tune_tolerance,
             "use_hw_encode": self.use_hw_encode,
             "window_geometry": self.window_geometry,
+            "window_maximized": self.window_maximized,
             "adv_panel_open": self.adv_panel_open,
             "log_panel_open": self.log_panel_open,
             "onboarding_seen": self.onboarding_seen,
@@ -444,6 +446,7 @@ class ProcessingConfig:
         self.output_quality = _coerce_int(self.output_quality, 23, 15, 35)
         self.use_hw_encode = _coerce_bool(self.use_hw_encode, True)
         self.window_geometry = _coerce_text(self.window_geometry, "", 64)
+        self.window_maximized = _coerce_bool(self.window_maximized, False)
         self.adv_panel_open = _coerce_bool(self.adv_panel_open, False)
         self.log_panel_open = _coerce_bool(self.log_panel_open, True)
         self.onboarding_seen = _coerce_bool(self.onboarding_seen, False)
@@ -499,6 +502,7 @@ class ProcessingConfig:
             colour_tune_tolerance=data.get("colour_tune_tolerance", 25),
             use_hw_encode=data.get("use_hw_encode", True),
             window_geometry=data.get("window_geometry", ""),
+            window_maximized=data.get("window_maximized", False),
             adv_panel_open=data.get("adv_panel_open", False),
             log_panel_open=data.get("log_panel_open", True),
             onboarding_seen=data.get("onboarding_seen", False),
@@ -2860,6 +2864,9 @@ class VideoSubtitleRemoverApp:
         # Left/right splitter ratio (left column share of total width). 0.57 mirrors
         # the previous 57:43 weighted grid so the default look is unchanged.
         self._sash_ratio = 0.57
+        # Last geometry while window was in normal (non-maximized) state, so we
+        # can persist a useful restore-position even when closing maximized.
+        self._last_normal_geometry: str = ""
         self._workflow_pills = []
         self._last_timeline_frames: Dict[str, int] = {}  # remember last timeline frame per queue item id
 
@@ -2967,13 +2974,15 @@ class VideoSubtitleRemoverApp:
         self._sync_config_from_ui()
         # Persist window layout and panel states for next launch
         try:
-            # When maximized, geometry() returns the full-screen dimensions
-            # which, on next launch, produces a non-centered non-maximized
-            # full-screen window. Save empty geometry so the centering
-            # fallback kicks in instead.
             if self.root.state() == "zoomed":
-                self.config.window_geometry = ""
+                # Save the pre-maximized geometry (size + position) so the
+                # window lands in the right spot after being un-maximized.
+                # Fall back to the current (maximized) geometry if we never
+                # captured a normal-state snapshot.
+                self.config.window_maximized = True
+                self.config.window_geometry = self._last_normal_geometry or self.root.geometry()
             else:
+                self.config.window_maximized = False
                 self.config.window_geometry = self.root.geometry()
             self.config.adv_panel_open = self.adv_visible
             self.config.log_panel_open = self._log_visible
@@ -3406,6 +3415,14 @@ class VideoSubtitleRemoverApp:
         """Keep layout responsive as the window width changes."""
         if event.widget is not self.root:
             return
+        # Snapshot the geometry while the window is in its normal (restored)
+        # state so _on_close can persist a useful position even if the user
+        # quits while the window is maximized.
+        try:
+            if self.root.state() not in ("zoomed", "iconic"):
+                self._last_normal_geometry = self.root.geometry()
+        except tk.TclError:
+            pass
         self._apply_responsive_layout(event.width)
 
     def _capture_sash_ratio(self, _event=None):
@@ -7975,6 +7992,11 @@ class VideoSubtitleRemoverApp:
             x = max(24, (screen_w // 2) - (width // 2))
             y = max(24, (screen_h // 2) - (height // 2))
             self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+        # Restore maximized state AFTER geometry is applied so the window
+        # remembers its restore-size when the user un-maximizes later.
+        if self.config.window_maximized:
+            self.root.state("zoomed")
 
         logger.info(f"{APP_NAME} v{APP_VERSION} started")
         logger.info(f"Log file: {LOG_FILE}")
