@@ -35,7 +35,7 @@ from datetime import datetime
 APP_NAME = "Video Subtitle Remover Pro"
 # Single source of truth for the app's version string. Update here and it
 # propagates to the banner, header, logs, About dialog, and CHANGELOG cue.
-APP_VERSION = "3.12.0"
+APP_VERSION = "3.15.0"
 APP_AUTHOR = "SysAdminDoc"
 
 LOG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "VideoSubtitleRemoverPro"
@@ -46,7 +46,14 @@ SETTINGS_FILE = LOG_DIR / "settings.json"
 # Bump VSR_SETTINGS_FORMAT whenever settings.json keys are renamed or
 # semantics change. _migrate_settings() must learn the upgrade path so
 # users never silently lose state on an in-place upgrade.
-VSR_SETTINGS_FORMAT = 1
+# Format 1 -> 2 (B-1, v3.13 GUI wiring pass): added loudnorm_target,
+# multi_audio_passthrough, decode_hw_accel, prefetch_decode,
+# prefetch_queue_size, input_fps, quality_report_sheet,
+# remove_subtitles, remove_chyrons, chyron_min_hits, karaoke_grouping,
+# karaoke_x_gap_px, karaoke_y_overlap. All have backend-default values
+# so a missing key in a format-1 file resolves to the same behaviour
+# users saw before the bump -- no field-rename migration needed.
+VSR_SETTINGS_FORMAT = 2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,6 +81,15 @@ def crash_handler(exc_type, exc_value, exc_tb):
 
 
 sys.excepthook = crash_handler
+
+# RM-52: opt-in crash reporting. Strictly off unless the user sets BOTH
+# VSR_GLITCHTIP_DSN AND VSR_CRASH_REPORTS=1. The install() call is a
+# no-op when either is missing, so default installs never phone home.
+try:
+    from backend.crash_reporter import install as _install_crash_reporter
+    _install_crash_reporter()
+except Exception:
+    pass
 
 # GUI Imports
 try:
@@ -180,6 +196,65 @@ class Theme:
     R_XL = 12
 
 
+def apply_high_contrast_theme():
+    """RM-96: Swap the design tokens for a higher-contrast palette.
+
+    Idempotent and reversible -- the original values are cached on
+    Theme._defaults so apply_default_theme() can restore them. The
+    custom Canvas widgets read Theme constants on every draw, so an
+    in-place swap takes effect after the next redraw cycle.
+    """
+    if not hasattr(Theme, "_defaults"):
+        Theme._defaults = {
+            k: v for k, v in Theme.__dict__.items()
+            if not k.startswith("_") and isinstance(v, str)
+        }
+    Theme.BG_DARK = "#000000"
+    Theme.BG_SECONDARY = "#000000"
+    Theme.BG_CARD = "#0c0c0c"
+    Theme.BG_CARD_HOVER = "#1a1a1a"
+    Theme.BG_CARD_SELECTED = "#1f1f1f"
+    Theme.BG_TERTIARY = "#1a1a1a"
+    Theme.BG_RAISED = "#262626"
+    Theme.BG_LOG = "#000000"
+    Theme.BG_OVERLAY = "#000000"
+    Theme.GREEN_PRIMARY = "#00ff7f"
+    Theme.GREEN_HOVER = "#00cc66"
+    Theme.GREEN_PRESS = "#00994d"
+    Theme.GREEN_MUTED = "#003319"
+    Theme.BLUE_PRIMARY = "#00d4ff"
+    Theme.BLUE_HOVER = "#00b3d9"
+    Theme.BLUE_PRESS = "#0099b3"
+    Theme.BLUE_MUTED = "#002633"
+    Theme.TEXT_PRIMARY = "#ffffff"
+    Theme.TEXT_SECONDARY = "#ffffff"
+    Theme.TEXT_MUTED = "#dcdcdc"
+    Theme.TEXT_DISABLED = "#888888"
+    Theme.SUCCESS = "#00ff7f"
+    Theme.SUCCESS_BG = "#003319"
+    Theme.WARNING = "#ffff00"
+    Theme.WARNING_BG = "#332f00"
+    Theme.ERROR = "#ff5555"
+    Theme.ERROR_BG = "#330000"
+    Theme.INFO = "#00d4ff"
+    Theme.INFO_BG = "#002633"
+    Theme.BORDER = "#ffffff"
+    Theme.BORDER_STRONG = "#ffffff"
+    Theme.BORDER_SUBTLE = "#aaaaaa"
+    Theme.BORDER_FOCUS = "#ffff00"
+    Theme.PROGRESS_BG = "#1a1a1a"
+    Theme.PROGRESS_FILL = "#00d4ff"
+
+
+def apply_default_theme():
+    """Restore the original Theme palette saved by apply_high_contrast_theme."""
+    defaults = getattr(Theme, "_defaults", None)
+    if not defaults:
+        return
+    for k, v in defaults.items():
+        setattr(Theme, k, v)
+
+
 def f(size: int, weight: str = "normal") -> tuple:
     """Shortcut to build a Segoe UI font tuple."""
     if weight == "bold":
@@ -274,6 +349,15 @@ class ProcessingConfig:
     # Detection settings
     detection_lang: str = "en"
     detection_threshold: float = 0.5
+    detection_vertical: bool = False    # RM-24 vertical-text mode
+    whisper_fallback: bool = False       # RM-27 Whisper-driven mask fallback
+    whisper_model_size: str = "tiny"
+    upscale_factor: int = 0              # RM-78 post-cleanup upscale (0/2/3/4)
+    film_grain_strength: float = 0.0     # RM-80 additive film grain (0..0.5)
+    swinir_restore: bool = False         # RM-79 SwinIR restoration pass
+    seedvr2_restore: bool = False        # RM-77 SeedVR2 restoration
+    preserve_color_metadata: bool = True  # RM-73 partial
+    nle_sidecar: str = "off"             # RM-76 (off / edl / fcpxml)
 
     # Time range (video only, seconds)
     time_start: float = 0.0
@@ -297,6 +381,10 @@ class ProcessingConfig:
     tbe_flow_warp: bool = False         # Farneback flow-warp before TBE aggregation
     tbe_scene_cut_split: bool = True    # split TBE batch at scene cuts
     tbe_scene_cut_threshold: float = 0.35
+    tbe_scene_cut_use_pyscenedetect: bool = False  # RM-32 opt-in dep
+    tbe_scene_cut_use_transnetv2: bool = False     # RM-21 opt-in dep
+    detection_denoise: bool = False                # RM-33 opt-in dep
+    sam2_refine: bool = False                      # RM-66 opt-in dep
     edge_ring_px: int = 2               # post-inpaint colour-match ring width
 
     # v3.9 workflow features
@@ -328,6 +416,27 @@ class ProcessingConfig:
     preserve_audio: bool = True
     output_quality: int = 23  # CRF value (15-35, lower = better quality)
     use_hw_encode: bool = True  # try hardware encoding (NVENC/QSV/AMF)
+    output_codec: str = "h264"   # h264 (default) / h265 / av1
+
+    # v3.13 -- exposed in GUI as of this build
+    # Audio
+    loudnorm_target: float = 0.0           # 0=off, otherwise LUFS in [-70,-5]
+    multi_audio_passthrough: bool = True   # mux every audio stream
+    # Performance / decode
+    decode_hw_accel: str = "off"           # off/auto/any/d3d11/vaapi/mfx
+    prefetch_decode: bool = True           # worker-thread frame prefetcher
+    prefetch_queue_size: int = 0           # 0=auto (max(8, batch_size*2))
+    input_fps: float = 24.0                # FPS for directory-of-images input
+    # Quality
+    quality_report_sheet: bool = False     # render side-by-side PNG
+    # Editorial filters (chyron classifier)
+    remove_subtitles: bool = True
+    remove_chyrons: bool = True
+    chyron_min_hits: int = 90              # Kalman hits to classify as chyron
+    # Karaoke per-syllable grouping
+    karaoke_grouping: bool = False
+    karaoke_x_gap_px: int = 20
+    karaoke_y_overlap: float = 0.5
 
     # UI state (persisted across sessions; not part of processing config)
     window_geometry: str = ""  # e.g. "1240x860+100+60"
@@ -340,61 +449,31 @@ class ProcessingConfig:
     # to the left column (0.0 = right gets all extra space, 1.0 = left
     # gets all extra). Default 0.57 mirrors the historical 57:43 weights.
     split_ratio: float = 0.57
+    high_contrast: bool = False     # RM-96 alt theme palette
+    rtl_layout: bool = False        # RM-98 right-to-left UI mirror
 
     def to_dict(self) -> dict:
-        return {
-            "mode": self.mode.value,
-            "use_gpu": self.use_gpu,
-            "gpu_id": self.gpu_id,
-            "sttn_skip_detection": self.sttn_skip_detection,
-            "sttn_neighbor_stride": self.sttn_neighbor_stride,
-            "sttn_reference_length": self.sttn_reference_length,
-            "sttn_max_load_num": self.sttn_max_load_num,
-            "lama_super_fast": self.lama_super_fast,
-            "subtitle_area": list(self.subtitle_area) if self.subtitle_area else None,
-            "detection_lang": self.detection_lang,
-            "detection_threshold": self.detection_threshold,
-            "output_format": self.output_format,
-            "preserve_audio": self.preserve_audio,
-            "output_quality": self.output_quality,
-            "time_start": self.time_start,
-            "time_end": self.time_end,
-            "detection_frame_skip": self.detection_frame_skip,
-            "mask_dilate_px": self.mask_dilate_px,
-            "mask_feather_px": self.mask_feather_px,
-            "tbe_enable": self.tbe_enable,
-            "tbe_min_coverage": self.tbe_min_coverage,
-            "tbe_use_median": self.tbe_use_median,
-            "tbe_flow_warp": self.tbe_flow_warp,
-            "tbe_scene_cut_split": self.tbe_scene_cut_split,
-            "tbe_scene_cut_threshold": self.tbe_scene_cut_threshold,
-            "edge_ring_px": self.edge_ring_px,
-            "subtitle_areas": [list(r) for r in self.subtitle_areas] if self.subtitle_areas else None,
-            "sam_mask_path": self.sam_mask_path,
-            "auto_band": self.auto_band,
-            "export_srt": self.export_srt,
-            "export_mask_video": self.export_mask_video,
-            "adaptive_batch": self.adaptive_batch,
-            "auto_exposure_threshold": self.auto_exposure_threshold,
-            "deinterlace": self.deinterlace,
-            "deinterlace_auto": self.deinterlace_auto,
-            "keyframe_detection": self.keyframe_detection,
-            "quality_report": self.quality_report,
-            "kalman_tracking": self.kalman_tracking,
-            "kalman_iou_threshold": self.kalman_iou_threshold,
-            "kalman_max_age": self.kalman_max_age,
-            "phash_skip_enable": self.phash_skip_enable,
-            "phash_skip_distance": self.phash_skip_distance,
-            "colour_tune_enable": self.colour_tune_enable,
-            "colour_tune_tolerance": self.colour_tune_tolerance,
-            "use_hw_encode": self.use_hw_encode,
-            "window_geometry": self.window_geometry,
-            "window_maximized": self.window_maximized,
-            "adv_panel_open": self.adv_panel_open,
-            "log_panel_open": self.log_panel_open,
-            "onboarding_seen": self.onboarding_seen,
-            "vsr_settings_format": VSR_SETTINGS_FORMAT,
-        }
+        """Persist every dataclass field automatically. Using
+        `dataclasses.fields` means new fields land in settings.json without
+        any further edits here -- the v3.13 GUI gap (13 backend fields
+        unreachable from the GUI) was rooted in a manual enumeration that
+        was easy to forget to update."""
+        from dataclasses import fields as _dc_fields
+        payload: dict = {}
+        for field_def in _dc_fields(self):
+            value = getattr(self, field_def.name)
+            if isinstance(value, InpaintMode):
+                payload[field_def.name] = value.value
+            elif field_def.name == "subtitle_area":
+                payload[field_def.name] = list(value) if value else None
+            elif field_def.name == "subtitle_areas":
+                payload[field_def.name] = (
+                    [list(r) for r in value] if value else None
+                )
+            else:
+                payload[field_def.name] = value
+        payload["vsr_settings_format"] = VSR_SETTINGS_FORMAT
+        return payload
 
     def normalized(self) -> 'ProcessingConfig':
         """Coerce persisted or imported values into a safe, UI-friendly shape."""
@@ -410,6 +489,24 @@ class ProcessingConfig:
         self.subtitle_areas = _coerce_rect_list(self.subtitle_areas)
         self.detection_lang = _coerce_text(self.detection_lang, "en", 24).lower()
         self.detection_threshold = _coerce_float(self.detection_threshold, 0.5, 0.1, 0.9)
+        self.detection_vertical = _coerce_bool(self.detection_vertical, False)
+        self.whisper_fallback = _coerce_bool(self.whisper_fallback, False)
+        wm = _coerce_text(self.whisper_model_size, "tiny", 16).lower()
+        if wm not in {"tiny", "base", "small", "medium", "large", "large-v2", "large-v3"}:
+            wm = "tiny"
+        self.whisper_model_size = wm
+        upscale = _coerce_int(self.upscale_factor, 0, 0, 4)
+        if upscale not in (0, 2, 3, 4):
+            upscale = 0
+        self.upscale_factor = upscale
+        self.film_grain_strength = _coerce_float(self.film_grain_strength, 0.0, 0.0, 0.5)
+        self.swinir_restore = _coerce_bool(self.swinir_restore, False)
+        self.seedvr2_restore = _coerce_bool(self.seedvr2_restore, False)
+        self.preserve_color_metadata = _coerce_bool(self.preserve_color_metadata, True)
+        sidecar = _coerce_text(self.nle_sidecar, "off", 16).lower()
+        if sidecar not in {"off", "edl", "fcpxml"}:
+            sidecar = "off"
+        self.nle_sidecar = sidecar
         self.time_start = max(0.0, _coerce_float(self.time_start, 0.0))
         self.time_end = max(0.0, _coerce_float(self.time_end, 0.0))
         if self.time_end and self.time_end < self.time_start:
@@ -423,6 +520,12 @@ class ProcessingConfig:
         self.tbe_flow_warp = _coerce_bool(self.tbe_flow_warp, False)
         self.tbe_scene_cut_split = _coerce_bool(self.tbe_scene_cut_split, True)
         self.tbe_scene_cut_threshold = _coerce_float(self.tbe_scene_cut_threshold, 0.35, 0.0, 1.0)
+        self.tbe_scene_cut_use_pyscenedetect = _coerce_bool(
+            self.tbe_scene_cut_use_pyscenedetect, False)
+        self.tbe_scene_cut_use_transnetv2 = _coerce_bool(
+            self.tbe_scene_cut_use_transnetv2, False)
+        self.detection_denoise = _coerce_bool(self.detection_denoise, False)
+        self.sam2_refine = _coerce_bool(self.sam2_refine, False)
         self.edge_ring_px = _coerce_int(self.edge_ring_px, 2, 0, 8)
         self.sam_mask_path = _coerce_text(getattr(self, "sam_mask_path", None), None, 1024)
         self.auto_band = _coerce_bool(self.auto_band, False)
@@ -445,68 +548,72 @@ class ProcessingConfig:
         self.preserve_audio = _coerce_bool(self.preserve_audio, True)
         self.output_quality = _coerce_int(self.output_quality, 23, 15, 35)
         self.use_hw_encode = _coerce_bool(self.use_hw_encode, True)
+        codec = _coerce_text(self.output_codec, "h264", 16).lower()
+        if codec in {"hevc", "h.265"}:
+            codec = "h265"
+        if codec not in {"h264", "h265", "av1"}:
+            codec = "h264"
+        self.output_codec = codec
+        # v3.13 GUI-exposed knobs -- mirror the backend coercion bounds so
+        # values that round-trip through settings.json land in the same
+        # safe shape that normalize_processing_config enforces.
+        target = _coerce_float(self.loudnorm_target, 0.0)
+        if target == 0.0 or -70.0 <= target <= -5.0:
+            self.loudnorm_target = target
+        else:
+            self.loudnorm_target = 0.0
+        accel = _coerce_text(self.decode_hw_accel, "off", 16).lower()
+        if accel not in {"off", "auto", "any", "d3d11", "vaapi", "mfx"}:
+            accel = "off"
+        self.decode_hw_accel = accel
+        self.multi_audio_passthrough = _coerce_bool(self.multi_audio_passthrough, True)
+        self.prefetch_decode = _coerce_bool(self.prefetch_decode, True)
+        self.prefetch_queue_size = _coerce_int(self.prefetch_queue_size, 0, 0, 512)
+        self.input_fps = _coerce_float(self.input_fps, 24.0, 1.0, 240.0)
+        self.quality_report_sheet = _coerce_bool(self.quality_report_sheet, False)
+        if self.quality_report_sheet:
+            self.quality_report = True
+        self.remove_subtitles = _coerce_bool(self.remove_subtitles, True)
+        self.remove_chyrons = _coerce_bool(self.remove_chyrons, True)
+        self.chyron_min_hits = _coerce_int(self.chyron_min_hits, 90, 1, 100000)
+        self.karaoke_grouping = _coerce_bool(self.karaoke_grouping, False)
+        self.karaoke_x_gap_px = _coerce_int(self.karaoke_x_gap_px, 20, 0, 1024)
+        self.karaoke_y_overlap = _coerce_float(self.karaoke_y_overlap, 0.5, 0.0, 1.0)
         self.window_geometry = _coerce_text(self.window_geometry, "", 64)
         self.window_maximized = _coerce_bool(self.window_maximized, False)
         self.adv_panel_open = _coerce_bool(self.adv_panel_open, False)
         self.log_panel_open = _coerce_bool(self.log_panel_open, True)
         self.onboarding_seen = _coerce_bool(self.onboarding_seen, False)
+        self.high_contrast = _coerce_bool(self.high_contrast, False)
+        self.rtl_layout = _coerce_bool(self.rtl_layout, False)
         return self
 
     @classmethod
     def from_dict(cls, data: dict) -> 'ProcessingConfig':
-        mode = data.get("mode", InpaintMode.STTN.value)
-        return cls(
-            mode=mode,
-            use_gpu=data.get("use_gpu", True),
-            gpu_id=data.get("gpu_id", 0),
-            sttn_skip_detection=data.get("sttn_skip_detection", False),
-            sttn_neighbor_stride=data.get("sttn_neighbor_stride", 10),
-            sttn_reference_length=data.get("sttn_reference_length", 10),
-            sttn_max_load_num=data.get("sttn_max_load_num", 30),
-            lama_super_fast=data.get("lama_super_fast", False),
-            subtitle_area=_coerce_rect(data.get("subtitle_area")),
-            detection_lang=data.get("detection_lang", "en"),
-            detection_threshold=data.get("detection_threshold", 0.5),
-            output_format=data.get("output_format", "mp4"),
-            preserve_audio=data.get("preserve_audio", True),
-            output_quality=data.get("output_quality", 23),
-            time_start=data.get("time_start", 0.0),
-            time_end=data.get("time_end", 0.0),
-            detection_frame_skip=data.get("detection_frame_skip", 0),
-            mask_dilate_px=data.get("mask_dilate_px", 8),
-            mask_feather_px=data.get("mask_feather_px", 4),
-            tbe_enable=data.get("tbe_enable", True),
-            tbe_min_coverage=data.get("tbe_min_coverage", 3),
-            tbe_use_median=data.get("tbe_use_median", True),
-            tbe_flow_warp=data.get("tbe_flow_warp", False),
-            tbe_scene_cut_split=data.get("tbe_scene_cut_split", True),
-            tbe_scene_cut_threshold=data.get("tbe_scene_cut_threshold", 0.35),
-            edge_ring_px=data.get("edge_ring_px", 2),
-            subtitle_areas=_coerce_rect_list(data.get("subtitle_areas")),
-            sam_mask_path=data.get("sam_mask_path", None),
-            auto_band=data.get("auto_band", False),
-            export_srt=data.get("export_srt", False),
-            export_mask_video=data.get("export_mask_video", False),
-            adaptive_batch=data.get("adaptive_batch", True),
-            auto_exposure_threshold=data.get("auto_exposure_threshold", 0.55),
-            deinterlace=data.get("deinterlace", False),
-            deinterlace_auto=data.get("deinterlace_auto", True),
-            keyframe_detection=data.get("keyframe_detection", False),
-            quality_report=data.get("quality_report", False),
-            kalman_tracking=data.get("kalman_tracking", True),
-            kalman_iou_threshold=data.get("kalman_iou_threshold", 0.3),
-            kalman_max_age=data.get("kalman_max_age", 2),
-            phash_skip_enable=data.get("phash_skip_enable", True),
-            phash_skip_distance=data.get("phash_skip_distance", 4),
-            colour_tune_enable=data.get("colour_tune_enable", False),
-            colour_tune_tolerance=data.get("colour_tune_tolerance", 25),
-            use_hw_encode=data.get("use_hw_encode", True),
-            window_geometry=data.get("window_geometry", ""),
-            window_maximized=data.get("window_maximized", False),
-            adv_panel_open=data.get("adv_panel_open", False),
-            log_panel_open=data.get("log_panel_open", True),
-            onboarding_seen=data.get("onboarding_seen", False),
-        ).normalized()
+        """Reconstruct a config from a settings.json payload. Walks
+        `dataclasses.fields` so every declared field is restored. Unknown
+        keys are ignored; missing keys fall back to the dataclass default.
+        Rect fields go through the dedicated coercers before normalisation
+        so a non-iterable payload (`{"subtitle_area": 42}`) never crashes
+        the loader -- the regression case covered by from_dict tests."""
+        if not isinstance(data, dict):
+            data = {}
+        from dataclasses import fields as _dc_fields
+        kwargs: dict = {}
+        for field_def in _dc_fields(cls):
+            name = field_def.name
+            if name not in data:
+                continue
+            raw = data.get(name)
+            if name == "mode":
+                kwargs[name] = raw  # _coerce_gui_mode applied in normalize
+            elif name == "subtitle_area":
+                kwargs[name] = _coerce_rect(raw)
+            elif name == "subtitle_areas":
+                kwargs[name] = _coerce_rect_list(raw)
+            else:
+                kwargs[name] = raw
+        return cls(**kwargs).normalized()
 
 
 @dataclass
@@ -524,6 +631,11 @@ class QueueItem:
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     quality_report: Optional[dict] = None
+    # F-7: per-item cancel flag. Set by the queue widget when the user
+    # asks to cancel just this entry. The progress callback in
+    # _process_item checks it alongside the global cancel_event so a
+    # single-item cancellation does NOT abort the rest of the batch.
+    cancel_requested: bool = False
 
 
 def _coerce_bool(value, default: bool) -> bool:
@@ -693,6 +805,15 @@ def _migrate_settings(data: dict) -> dict:
         data["vsr_settings_format"] = 1
         version = 1
 
+    # version 1 -> 2: B-1 wired the 13 v3.13 backend fields through the
+    # GUI. The new keys default to the backend's existing defaults so a
+    # legacy payload missing them resolves to the v3.12 behaviour; we
+    # only need to bump the version tag here.
+    if version < 2:
+        data = dict(data)
+        data["vsr_settings_format"] = 2
+        version = 2
+
     return data
 
 
@@ -726,86 +847,11 @@ def save_settings(config: ProcessingConfig):
 
 PRESETS_FILE = LOG_DIR / "presets.json"
 
-# Built-in presets tuned for common content types. Only the fields that
-# matter for each recipe are set; everything else inherits from the current
-# config when the preset is applied (so user-tuned quality knobs survive).
-BUILTIN_PRESETS = {
-    "YouTube (default)": {
-        "description": "Balanced defaults for typical YouTube / streaming footage.",
-        "fields": {
-            "mode": "STTN",
-            "detection_threshold": 0.5,
-            "mask_dilate_px": 8,
-            "mask_feather_px": 4,
-            "edge_ring_px": 2,
-            "tbe_flow_warp": False,
-            "tbe_scene_cut_split": True,
-            "colour_tune_enable": False,
-            "kalman_tracking": True,
-            "phash_skip_enable": True,
-        },
-    },
-    "Anime / Animation": {
-        "description": "Flat backgrounds benefit from LAMA + tight feather.",
-        "fields": {
-            "mode": "LAMA",
-            "detection_threshold": 0.55,
-            "mask_dilate_px": 10,
-            "mask_feather_px": 3,
-            "edge_ring_px": 0,
-            "colour_tune_enable": True,
-            "colour_tune_tolerance": 30,
-        },
-    },
-    "Motion-heavy / Action": {
-        "description": "Enables flow-warped TBE + ProPainter for fast pans.",
-        "fields": {
-            "mode": "ProPainter",
-            "detection_threshold": 0.45,
-            "mask_dilate_px": 12,
-            "mask_feather_px": 6,
-            "edge_ring_px": 3,
-            "tbe_flow_warp": True,
-            "tbe_scene_cut_split": True,
-            "kalman_tracking": True,
-        },
-    },
-    "TikTok / Vertical short": {
-        "description": "9:16 short-form with bold burned-in captions.",
-        "fields": {
-            "mode": "STTN",
-            "detection_threshold": 0.4,
-            "mask_dilate_px": 14,
-            "mask_feather_px": 5,
-            "colour_tune_enable": True,
-            "auto_band": True,
-        },
-    },
-    "VHS / Low-res restore": {
-        "description": "Noisy SD footage; higher feather and tolerant pHash.",
-        "fields": {
-            "mode": "STTN",
-            "detection_threshold": 0.4,
-            "mask_dilate_px": 10,
-            "mask_feather_px": 6,
-            "edge_ring_px": 4,
-            "phash_skip_enable": True,
-            "phash_skip_distance": 8,
-            "kalman_tracking": True,
-        },
-    },
-    "News / Chyron (bottom-third)": {
-        "description": "Lower-third graphics; auto-band + STTN + tight mask.",
-        "fields": {
-            "mode": "STTN",
-            "detection_threshold": 0.5,
-            "auto_band": True,
-            "mask_dilate_px": 6,
-            "mask_feather_px": 3,
-            "kalman_tracking": True,
-        },
-    },
-}
+# F-10: built-in presets live in backend/presets.py so the CLI's
+# --preset flag and the GUI's preset picker resolve from the same source.
+# The shared module also exposes resolve_preset/preset_fields helpers we
+# could swap in here over time -- for now we just import the table.
+from backend.presets import BUILTIN_PRESETS
 
 
 def _load_user_presets() -> dict:
@@ -1028,6 +1074,103 @@ def is_image_file(path: str) -> bool:
     return Path(path).suffix.lower() in image_extensions
 
 
+# F-5: curated friendly names for languages the project always shipped
+# with. Languages the active engine adds beyond this list inherit the
+# raw code as their display name.
+_CURATED_LANG_NAMES: Tuple[Tuple[str, str], ...] = (
+    ("en", "English"),
+    ("ch", "Chinese"),
+    ("japan", "Japanese"),
+    ("ja", "Japanese"),
+    ("manga", "Manga / Anime (vertical JP via manga-ocr)"),
+    ("ko", "Korean"),
+    ("korean", "Korean"),
+    ("fr", "French"),
+    ("french", "French"),
+    ("de", "German"),
+    ("german", "German"),
+    ("es", "Spanish"),
+    ("spanish", "Spanish"),
+    ("pt", "Portuguese"),
+    ("portuguese", "Portuguese"),
+    ("ru", "Russian"),
+    ("ar", "Arabic"),
+    ("arabic", "Arabic"),
+    ("hi", "Hindi"),
+    ("it", "Italian"),
+    ("italian", "Italian"),
+    ("nl", "Dutch"),
+    ("pl", "Polish"),
+    ("tr", "Turkish"),
+    ("vi", "Vietnamese"),
+    ("th", "Thai"),
+    ("uk", "Ukrainian"),
+    ("sv", "Swedish"),
+    ("no", "Norwegian"),
+    ("da", "Danish"),
+    ("fi", "Finnish"),
+    ("cs", "Czech"),
+    ("hu", "Hungarian"),
+    ("ro", "Romanian"),
+    ("el", "Greek"),
+    ("he", "Hebrew"),
+    ("id", "Indonesian"),
+    ("ms", "Malay"),
+    ("fil", "Filipino"),
+)
+
+
+def _engine_supported_languages() -> List[str]:
+    """Best-effort list of language codes the active OCR cascade can
+    drive. We do not import the engines just to read their lang lists
+    (heavy); we ask each module for a constant if it exposes one.
+    """
+    codes: List[str] = []
+    # PaddleOCR exposes a published list of 80+ codes; we hard-code a
+    # subset shared across PaddleOCR / RapidOCR / EasyOCR rather than
+    # importing the engine to read its config.
+    paddle_compatible = [
+        "en", "ch", "chinese_cht", "japan", "korean", "ka",
+        "fr", "german", "it", "es", "pt", "ru", "ar", "hi",
+        "nl", "no", "pl", "tr", "th", "vi", "uk", "be",
+        "bg", "hr", "cs", "da", "et", "fi", "hu", "is",
+        "lv", "lt", "mt", "ro", "sk", "sl", "sv", "id", "ms",
+        "fa", "he", "el",
+    ]
+    codes.extend(paddle_compatible)
+    return codes
+
+
+def _build_language_list() -> List[Tuple[str, str]]:
+    """Return [(code, friendly_name)] pairs to populate the lang picker.
+
+    Curated friendly names take precedence; engine-supported codes that
+    aren't in the curated table fall through with the raw code as their
+    label so the picker still surfaces them.
+    """
+    pretty: Dict[str, str] = {}
+    for code, name in _CURATED_LANG_NAMES:
+        pretty.setdefault(code, name)
+    out: List[Tuple[str, str]] = []
+    seen: set = set()
+    # English first (always the default).
+    out.append(("en", "English"))
+    seen.add("en")
+    # Curated order next so the picker leads with familiar options.
+    for code, name in _CURATED_LANG_NAMES:
+        if code in seen:
+            continue
+        seen.add(code)
+        out.append((code, name))
+    # Any extra engine-declared codes the curated list missed.
+    for code in _engine_supported_languages():
+        if code in seen:
+            continue
+        seen.add(code)
+        out.append((code, pretty.get(code, code.upper())))
+    return out
+
+
 def detect_ai_engines() -> dict:
     """Probe which AI engines are available."""
     engines = {"detection": [], "inpainting": []}
@@ -1045,9 +1188,13 @@ def detect_ai_engines() -> dict:
         engines["detection"].append("PaddleOCR")
     except ImportError:
         pass
+    surya_opt_in = os.environ.get("VSR_ALLOW_GPL", "").strip().lower() in {"1", "true", "yes", "on"}
     try:
         from surya.detection import DetectionPredictor  # noqa: F401
-        engines["detection"].append("Surya")
+        if surya_opt_in:
+            engines["detection"].append("Surya")
+        else:
+            engines["detection"].append("Surya (GPL -- set VSR_ALLOW_GPL=1)")
     except Exception:
         pass
     try:
@@ -1110,7 +1257,11 @@ def truncate_middle(text: str, max_length: int = 56) -> str:
 
 
 def format_quality_report(metrics: Optional[dict], compact: bool = False) -> str:
-    """Format a PSNR / SSIM quality-report payload for the UI."""
+    """Format a PSNR / SSIM quality-report payload for the UI.
+
+    When the backend returns a `roi_psnr`/`roi_ssim` pair (B-3), surface the
+    inpaint-region score first -- that is the metric users actually care
+    about. The whole-frame score is reported alongside as context."""
     if not metrics:
         return ""
     try:
@@ -1119,7 +1270,25 @@ def format_quality_report(metrics: Optional[dict], compact: bool = False) -> str
     except (TypeError, ValueError):
         return ""
 
+    roi_psnr_raw = metrics.get("roi_psnr")
+    roi_ssim_raw = metrics.get("roi_ssim")
+    roi_psnr = None
+    roi_ssim = None
+    try:
+        if roi_psnr_raw is not None:
+            roi_psnr = float(roi_psnr_raw)
+        if roi_ssim_raw is not None:
+            roi_ssim = float(roi_ssim_raw)
+    except (TypeError, ValueError):
+        roi_psnr = None
+        roi_ssim = None
+
     if compact:
+        if roi_psnr is not None and roi_ssim is not None:
+            return (
+                f"inpaint PSNR {roi_psnr:.1f} dB - SSIM {roi_ssim:.4f} "
+                f"(frame SSIM {ssim:.4f})"
+            )
         return f"PSNR {psnr:.1f} dB - SSIM {ssim:.4f}"
 
     samples = metrics.get("samples")
@@ -1131,6 +1300,11 @@ def format_quality_report(metrics: Optional[dict], compact: bool = False) -> str
     suffix = ""
     if sample_count > 0:
         suffix = f" across {sample_count} sampled frame{'s' if sample_count != 1 else ''}"
+    if roi_psnr is not None and roi_ssim is not None:
+        return (
+            f"inpaint region PSNR {roi_psnr:.2f} dB and SSIM {roi_ssim:.4f}, "
+            f"whole frame PSNR {psnr:.2f} dB and SSIM {ssim:.4f}{suffix}"
+        )
     return f"PSNR {psnr:.2f} dB and SSIM {ssim:.4f}{suffix}"
 
 
@@ -2433,6 +2607,8 @@ class QueueItemWidget(tk.Frame):
 
     def __init__(self, parent, item: QueueItem, on_remove: Callable,
                  on_select: Callable = None, on_rename: Callable = None,
+                 on_repeat: Callable = None, on_cancel_item: Callable = None,
+                 on_override: Callable = None,
                  **kwargs):
         super().__init__(parent, bg=Theme.BG_CARD, highlightthickness=1,
                         highlightbackground=Theme.BORDER)
@@ -2441,6 +2617,9 @@ class QueueItemWidget(tk.Frame):
         self.on_remove = on_remove
         self.on_select = on_select
         self.on_rename = on_rename
+        self.on_repeat = on_repeat
+        self.on_cancel_item = on_cancel_item
+        self.on_override = on_override
         self.is_selected = False
         self._surface_bg = Theme.BG_CARD
         self._pulse_id = None
@@ -2561,6 +2740,25 @@ class QueueItemWidget(tk.Frame):
                          state="normal" if rename_allowed else "disabled")
         menu.add_command(label="Copy source path",
                          command=self._copy_source_path)
+        # RM-28: re-queue the same source with the snapshot of settings
+        # that was active on this item. Useful when re-running with a
+        # tweaked global config but you still want exactly the same
+        # per-file overrides as a previous run.
+        if self.on_repeat is not None:
+            menu.add_command(label="Repeat with these settings",
+                             command=lambda: self.on_repeat(self.item.id))
+        # F-7: per-item cancel. Only meaningful while the item is
+        # actively running -- on IDLE entries we surface "Remove"
+        # below as the equivalent action.
+        if self.on_cancel_item is not None and is_active:
+            menu.add_command(label="Cancel this item",
+                             command=lambda: self.on_cancel_item(self.item.id))
+        # RM-29: open the per-file override dialog so users can change
+        # mode / language / sensitivity for a single queued item
+        # without touching the global settings.
+        if self.on_override is not None and self.item.status == ProcessingStatus.IDLE:
+            menu.add_command(label="Override settings for this file...",
+                             command=lambda: self.on_override(self.item.id))
         menu.add_separator()
         menu.add_command(label="Remove from queue",
                          command=lambda: self.on_remove(self.item.id),
@@ -2855,6 +3053,26 @@ class VideoSubtitleRemoverApp:
 
         # State
         self.config = load_settings()
+        # RM-96: high-contrast theme applies BEFORE widget construction so
+        # every Canvas / ttk style reads the swapped palette on first draw.
+        if getattr(self.config, "high_contrast", False):
+            apply_high_contrast_theme()
+        # RM-98: RTL layout mirror -- set the Tk option DB before widgets
+        # build so labels right-align and `pack(side="right")` becomes
+        # the dominant orientation. Full pack-side flipping for every
+        # widget is a much larger pass; this lands the framework.
+        self._rtl_layout = bool(getattr(self.config, "rtl_layout", False))
+        # RM-97: bind a gettext catalog if one matches the user's locale.
+        # No-op when no `.mo` file ships -- every UI string falls back to
+        # the literal english form.
+        try:
+            import locale as _locale
+            _user_locale = (_locale.getlocale()[0] or "").split("_")[0]
+            from backend.i18n import bind_locale as _bind_locale
+            if _user_locale and _user_locale != "en":
+                _bind_locale(_user_locale)
+        except Exception:
+            pass
         self.queue: List[QueueItem] = []
         self.queue_widgets: dict = {}
         self.is_processing = False
@@ -3071,6 +3289,29 @@ class VideoSubtitleRemoverApp:
             self.config.keyframe_detection = self.keyframe_var.get()
         if hasattr(self, 'quality_report_var'):
             self.config.quality_report = self.quality_report_var.get()
+        # v3.13 GUI-exposed toggles
+        if hasattr(self, 'quality_sheet_var'):
+            self.config.quality_report_sheet = self.quality_sheet_var.get()
+        if hasattr(self, 'multi_audio_var'):
+            self.config.multi_audio_passthrough = self.multi_audio_var.get()
+        if hasattr(self, 'loudnorm_var'):
+            self.config.loudnorm_target = self._safe_float(self.loudnorm_var.get(), 0.0)
+        if hasattr(self, 'decode_accel_var'):
+            self.config.decode_hw_accel = self.decode_accel_var.get()
+        if hasattr(self, 'prefetch_var'):
+            self.config.prefetch_decode = self.prefetch_var.get()
+        if hasattr(self, 'remove_subs_var'):
+            self.config.remove_subtitles = self.remove_subs_var.get()
+        if hasattr(self, 'remove_chyrons_var'):
+            self.config.remove_chyrons = self.remove_chyrons_var.get()
+        if hasattr(self, 'karaoke_grouping_var'):
+            self.config.karaoke_grouping = self.karaoke_grouping_var.get()
+        if hasattr(self, 'output_codec_var'):
+            self.config.output_codec = self.output_codec_var.get()
+        if hasattr(self, 'vertical_text_var'):
+            self.config.detection_vertical = self.vertical_text_var.get()
+        if hasattr(self, 'high_contrast_var'):
+            self.config.high_contrast = self.high_contrast_var.get()
         # GPU sync
         selection = self.gpu_var.get()
         for gpu in self.gpus:
@@ -3680,6 +3921,17 @@ class VideoSubtitleRemoverApp:
         can_preview = bool(selected and PIL_AVAILABLE)
         self.preview_mask_btn.set_enabled(bool(selected) and not self.is_processing)
         self.preview_zoom_btn.set_enabled(can_preview)
+        if hasattr(self, "preview_inpaint_btn"):
+            self.preview_inpaint_btn.set_enabled(
+                bool(selected) and not self.is_processing
+            )
+        if hasattr(self, "preview_ab_btn"):
+            ab_ready = bool(
+                selected
+                and selected.status == ProcessingStatus.COMPLETE
+                and Path(selected.output_path).exists()
+            )
+            self.preview_ab_btn.set_enabled(ab_ready)
         self._preview_label.config(cursor="hand2" if can_preview else "")
 
         if selected:
@@ -3700,6 +3952,271 @@ class VideoSubtitleRemoverApp:
         item = self._get_selected_queue_item()
         if item:
             self._show_preview(item, show_mask=True)
+
+    def _open_ab_scrubber(self):
+        """RM-30: open a Toplevel that lets the user scrub frames AND
+        wipe a vertical seam left/right to compare the original vs the
+        cleaned output side-by-side at any frame.
+
+        The window opens both video captures, holds them open for the
+        duration of the modal, and composes a single image per scrub.
+        """
+        item = self._get_selected_queue_item()
+        if item is None or item.status != ProcessingStatus.COMPLETE:
+            self._update_status("Select a completed item first", "warning")
+            return
+        in_path = item.file_path
+        out_path = item.output_path
+        if not Path(out_path).exists():
+            self._update_status("Output file is missing", "warning")
+            return
+        if not PIL_AVAILABLE:
+            self._update_status("Pillow required for A/B compare", "warning")
+            return
+
+        import cv2 as _cv2
+        cap_a = _cv2.VideoCapture(in_path)
+        cap_b = _cv2.VideoCapture(out_path)
+        if not cap_a.isOpened() or not cap_b.isOpened():
+            cap_a.release(); cap_b.release()
+            self._update_status("Could not open input/output for compare", "warning")
+            return
+
+        n_a = int(cap_a.get(_cv2.CAP_PROP_FRAME_COUNT)) or 1
+        n_b = int(cap_b.get(_cv2.CAP_PROP_FRAME_COUNT)) or 1
+        n_total = max(1, min(n_a, n_b))
+        fps = cap_a.get(_cv2.CAP_PROP_FPS) or 30.0
+        if fps <= 0:
+            fps = 30.0
+        max_w = min(1024, int(self.root.winfo_screenwidth() * 0.7))
+        max_h = min(576, int(self.root.winfo_screenheight() * 0.6))
+
+        win = tk.Toplevel(self.root)
+        win.title(f"A/B compare: {Path(in_path).name}")
+        win.configure(bg=Theme.BG_OVERLAY)
+        win.resizable(False, False)
+
+        canvas = tk.Canvas(win, width=max_w, height=max_h,
+                            highlightthickness=0, bg=Theme.BG_DARK)
+        canvas.pack()
+        image_id = canvas.create_image(0, 0, anchor="nw")
+        canvas._photo = None
+
+        state = {"frame_idx": 0, "seam": max_w // 2}
+
+        def _render():
+            cap_a.set(_cv2.CAP_PROP_POS_FRAMES, state["frame_idx"])
+            ok_a, fa = cap_a.read()
+            cap_b.set(_cv2.CAP_PROP_POS_FRAMES, min(n_b - 1, state["frame_idx"]))
+            ok_b, fb = cap_b.read()
+            if not (ok_a and ok_b):
+                return
+            if fa.shape != fb.shape:
+                fb = _cv2.resize(fb, (fa.shape[1], fa.shape[0]),
+                                  interpolation=_cv2.INTER_AREA)
+            h, w = fa.shape[:2]
+            scale = min(max_w / w, max_h / h, 1.0)
+            dw, dh = int(w * scale), int(h * scale)
+            seam = max(0, min(dw, state["seam"]))
+            fa_r = _cv2.resize(fa, (dw, dh), interpolation=_cv2.INTER_AREA)
+            fb_r = _cv2.resize(fb, (dw, dh), interpolation=_cv2.INTER_AREA)
+            composite = fa_r.copy()
+            composite[:, seam:] = fb_r[:, seam:]
+            # Draw a 2-pixel green seam line for the wipe boundary.
+            if 0 < seam < dw:
+                _cv2.line(composite, (seam, 0), (seam, dh - 1), (0, 255, 0), 2)
+            rgb = _cv2.cvtColor(composite, _cv2.COLOR_BGR2RGB)
+            pil = Image.fromarray(rgb)
+            canvas._photo = ImageTk.PhotoImage(pil)
+            canvas.itemconfig(image_id, image=canvas._photo)
+
+        # Frame slider (vertical -- below the image).
+        slider_row = tk.Frame(win, bg=Theme.BG_OVERLAY)
+        slider_row.pack(fill="x", padx=Theme.S_MD, pady=(Theme.S_SM, 0))
+        tk.Label(slider_row, text="Frame", font=f(Theme.F_BODY_SM),
+                 bg=Theme.BG_OVERLAY, fg=Theme.TEXT_SECONDARY).pack(side="left")
+        ts_label = tk.Label(slider_row, text="00:00:00",
+                            font=f(Theme.F_META),
+                            bg=Theme.BG_OVERLAY, fg=Theme.TEXT_MUTED)
+        ts_label.pack(side="right")
+
+        def _on_frame(value):
+            try:
+                state["frame_idx"] = max(0, min(n_total - 1, int(float(value))))
+            except (TypeError, ValueError):
+                return
+            secs = state["frame_idx"] / fps
+            hh = int(secs // 3600); mm = int((secs % 3600) // 60); ss = int(secs % 60)
+            ts_label.config(text=f"{hh:02d}:{mm:02d}:{ss:02d}")
+            _render()
+
+        frame_slider = tk.Scale(
+            win, from_=0, to=n_total - 1, orient="horizontal",
+            command=_on_frame, showvalue=False, length=max_w - 24,
+            bg=Theme.BG_OVERLAY, fg=Theme.TEXT_PRIMARY,
+            troughcolor=Theme.BG_TERTIARY,
+            activebackground=Theme.BLUE_PRIMARY, highlightthickness=0,
+        )
+        frame_slider.pack(fill="x", padx=Theme.S_MD, pady=(0, Theme.S_SM))
+
+        # Seam slider (wipe boundary).
+        seam_row = tk.Frame(win, bg=Theme.BG_OVERLAY)
+        seam_row.pack(fill="x", padx=Theme.S_MD, pady=(0, 0))
+        tk.Label(seam_row, text="Wipe", font=f(Theme.F_BODY_SM),
+                 bg=Theme.BG_OVERLAY, fg=Theme.TEXT_SECONDARY).pack(side="left")
+        tk.Label(seam_row, text="source <-> cleaned",
+                 font=f(Theme.F_META),
+                 bg=Theme.BG_OVERLAY, fg=Theme.TEXT_MUTED).pack(side="right")
+
+        def _on_seam(value):
+            try:
+                state["seam"] = max(0, min(max_w, int(float(value))))
+            except (TypeError, ValueError):
+                return
+            _render()
+
+        seam_slider = tk.Scale(
+            win, from_=0, to=max_w, orient="horizontal",
+            command=_on_seam, showvalue=False, length=max_w - 24,
+            bg=Theme.BG_OVERLAY, fg=Theme.TEXT_PRIMARY,
+            troughcolor=Theme.BG_TERTIARY,
+            activebackground=Theme.GREEN_PRIMARY, highlightthickness=0,
+        )
+        seam_slider.set(state["seam"])
+        seam_slider.pack(fill="x", padx=Theme.S_MD, pady=(0, Theme.S_MD))
+
+        def _close():
+            try:
+                cap_a.release(); cap_b.release()
+            except Exception:
+                pass
+            win.destroy()
+
+        win.bind("<Escape>", lambda e: _close())
+        win.protocol("WM_DELETE_WINDOW", _close)
+        win.transient(self.root)
+        win.grab_set()
+        _render()
+
+    def _open_selected_inpaint_preview(self):
+        """F-3: run a single-frame detect + inpaint pass on the selected
+        item and render the result in the preview pane. Lets users A/B
+        settings without committing a full batch run."""
+        item = self._get_selected_queue_item()
+        if item is None:
+            self._update_status("Select a queue item first", "warning")
+            return
+        if self.is_processing:
+            self._update_status("Pause the batch before previewing", "warning")
+            return
+        if not PIL_AVAILABLE:
+            self._update_status("Pillow required for inpaint preview", "warning")
+            return
+
+        self.preview_title_label.config(text=f"Inpainting {Path(item.file_path).name}")
+        self.preview_meta_label.config(text="Running detect + inpaint on the first frame...")
+        self._preview_label.config(image="", text="")
+        self._preview_photo = None
+        self._start_throbber()
+        self._preview_label.update_idletasks()
+        self._preview_request_id += 1
+        request_id = self._preview_request_id
+        snapshot_cfg = ProcessingConfig.from_dict(item.config.to_dict())
+        source_path = item.file_path
+
+        def _worker():
+            import cv2 as _cv2
+            try:
+                from backend.processor import (
+                    SubtitleRemover as _Remover,
+                    ProcessingConfig as _BackendCfg,
+                    InpaintMode as _BackendMode,
+                )
+                if is_image_file(source_path):
+                    frame = _cv2.imread(source_path)
+                elif is_video_file(source_path):
+                    cap = _cv2.VideoCapture(source_path)
+                    try:
+                        ret, frame = cap.read()
+                    finally:
+                        cap.release()
+                    if not ret:
+                        frame = None
+                else:
+                    frame = None
+                if frame is None:
+                    self.root.after(0, lambda: (
+                        self._stop_throbber(),
+                        self.preview_title_label.config(text="Preview unavailable"),
+                        self.preview_meta_label.config(text="The selected file could not be read."),
+                    ))
+                    return
+
+                # Build a backend config snapshot from the item.
+                mode_map = {
+                    "Auto": _BackendMode.AUTO,
+                    "STTN": _BackendMode.STTN,
+                    "LAMA": _BackendMode.LAMA,
+                    "ProPainter": _BackendMode.PROPAINTER,
+                }
+                backend_cfg = _BackendCfg(
+                    mode=mode_map.get(snapshot_cfg.mode.value, _BackendMode.STTN),
+                    device="cpu" if not snapshot_cfg.use_gpu else f"cuda:{snapshot_cfg.gpu_id}",
+                    detection_lang=snapshot_cfg.detection_lang,
+                    detection_threshold=snapshot_cfg.detection_threshold,
+                    subtitle_area=snapshot_cfg.subtitle_area,
+                    subtitle_areas=snapshot_cfg.subtitle_areas,
+                    mask_dilate_px=snapshot_cfg.mask_dilate_px,
+                    mask_feather_px=snapshot_cfg.mask_feather_px,
+                    tbe_enable=snapshot_cfg.tbe_enable,
+                )
+                remover = _Remover(backend_cfg)
+                # Single-frame inpaint -- detect, build mask, inpaint.
+                fixed = (snapshot_cfg.subtitle_areas
+                          or ([snapshot_cfg.subtitle_area] if snapshot_cfg.subtitle_area else None))
+                if fixed:
+                    boxes = list(fixed)
+                else:
+                    boxes = remover.detector.detect(
+                        frame, snapshot_cfg.detection_threshold)
+                if not boxes:
+                    # No detection -- show the source with a hint.
+                    pil = Image.fromarray(_cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB))
+                    self.root.after(0, lambda: self._apply_inpaint_preview(
+                        pil, "No text detected on the first frame", request_id, item.id))
+                    return
+                mask = remover._create_mask(frame.shape, boxes)
+                [filled] = remover.inpainter.inpaint([frame], [mask])
+                pil = Image.fromarray(_cv2.cvtColor(filled, _cv2.COLOR_BGR2RGB))
+                meta = (f"Cleanup preview using {snapshot_cfg.mode.value}; "
+                        f"{len(boxes)} region{'s' if len(boxes) != 1 else ''} masked.")
+                self.root.after(0, lambda: self._apply_inpaint_preview(
+                    pil, meta, request_id, item.id))
+            except Exception as exc:
+                logger.warning(f"Inpaint preview failed: {exc}")
+                self.root.after(0, lambda: (
+                    self._stop_throbber(),
+                    self.preview_title_label.config(text="Inpaint preview failed"),
+                    self.preview_meta_label.config(text=str(exc)),
+                ))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_inpaint_preview(self, pil_img, meta_text, request_id, item_id):
+        if (request_id != self._preview_request_id
+                or self._selected_queue_item_id != item_id):
+            return
+        try:
+            self._stop_throbber()
+            max_w = max(220, self._preview_frame.winfo_width() - 36)
+            max_h = 158
+            pil_img.thumbnail((max_w, max_h), Image.LANCZOS)
+            self._preview_photo = ImageTk.PhotoImage(pil_img)
+            self._preview_label.config(image=self._preview_photo, text="")
+            self.preview_title_label.config(text="Inpaint preview")
+            self.preview_meta_label.config(text=meta_text)
+        except Exception:
+            pass
 
     def _build_ui(self):
         """Build the main user interface with balanced spacing rhythm."""
@@ -4051,21 +4568,11 @@ class VideoSubtitleRemoverApp:
         tk.Label(lang_row, text="Subtitle language", font=f(Theme.F_BODY_SM),
                  bg=Theme.BG_CARD, fg=Theme.TEXT_SECONDARY).pack(side="left")
 
-        # Language codes mapped to friendly display names
-        self._lang_display = [
-            ("en", "English"),
-            ("ch", "Chinese"),
-            ("ja", "Japanese"),
-            ("ko", "Korean"),
-            ("fr", "French"),
-            ("de", "German"),
-            ("es", "Spanish"),
-            ("pt", "Portuguese"),
-            ("ru", "Russian"),
-            ("ar", "Arabic"),
-            ("hi", "Hindi"),
-            ("it", "Italian"),
-        ]
+        # F-5: language list = the union of curated friendly names and
+        # any extra codes the active OCR engine declares it supports.
+        # PaddleOCR / RapidOCR ship 100+ languages; we expose the union
+        # so users can pick e.g. Thai or Polish without modifying code.
+        self._lang_display = _build_language_list()
         self._lang_labels = [f"{name} ({code})" for code, name in self._lang_display]
         self._lang_by_label = {label: code for label, (code, _) in
                                zip(self._lang_labels, self._lang_display)}
@@ -4186,10 +4693,10 @@ class VideoSubtitleRemoverApp:
         det_frame.pack(fill="x", pady=(0, Theme.S_SM))
         self._card_header(det_frame, "Detection", "Precision tuning")
 
-        self._create_slider(det_frame, "Threshold", 10, 90,
+        self._create_slider(det_frame, "Sensitivity", 10, 90,
                             int(self.config.detection_threshold * 100),
                             "_detection_threshold_pct",
-                            hint="Lower detects more text, higher reduces false positives.")
+                            hint="Higher catches more text (lower confidence floor). Lower is stricter.")
         self._create_slider(det_frame, "Frame skip", 0, 10,
                             self.config.detection_frame_skip, "detection_frame_skip",
                             hint="Reuse the last mask for N frames to speed up long videos.")
@@ -4254,8 +4761,18 @@ class VideoSubtitleRemoverApp:
             text="Colour-tuned mask expansion",
             variable=self.colour_tune_var,
         )
-        colour_toggle.pack(anchor="w", padx=Theme.S_LG, pady=(Theme.S_SM, Theme.S_MD))
+        colour_toggle.pack(anchor="w", padx=Theme.S_LG, pady=(Theme.S_SM, 0))
         Tooltip(colour_toggle, "Grow the mask to cover serifs / drop shadows that match the subtitle colour. Catches decorative lettering.")
+
+        # RM-24: vertical-text toggle for Japanese tategaki / classical CN.
+        self.vertical_text_var = tk.BooleanVar(value=getattr(self.config, "detection_vertical", False))
+        vertical_toggle = ModernToggle(
+            det_frame,
+            text="Vertical text mode (Japanese tategaki / classical Chinese)",
+            variable=self.vertical_text_var,
+        )
+        vertical_toggle.pack(anchor="w", padx=Theme.S_LG, pady=(Theme.S_SM, Theme.S_MD))
+        Tooltip(vertical_toggle, "Rotates each frame 90 CCW before OCR so columnar CJK reads as a line. Boxes rotate back to the source frame.")
 
         tk.Frame(det_frame, bg=Theme.BG_CARD, height=Theme.S_SM).pack(fill="x")
 
@@ -4276,6 +4793,21 @@ class VideoSubtitleRemoverApp:
         )
         self.hw_encode_check.pack(anchor="w", padx=Theme.S_LG, pady=(Theme.S_SM, 0))
         Tooltip(self.hw_encode_check, "If hardware encoding fails the app retries automatically with libx264.")
+
+        # F-8: output codec selector lives next to the HW-encode toggle.
+        codec_row = tk.Frame(quality_frame, bg=Theme.BG_CARD)
+        codec_row.pack(fill="x", padx=Theme.S_LG, pady=(Theme.S_SM, 0))
+        tk.Label(codec_row, text="Output codec", font=f(Theme.F_BODY_SM),
+                 bg=Theme.BG_CARD, fg=Theme.TEXT_SECONDARY).pack(side="left")
+        self.output_codec_var = tk.StringVar(value=getattr(self.config, "output_codec", "h264"))
+        codec_combo = ttk.Combobox(
+            codec_row, textvariable=self.output_codec_var, width=10,
+            values=["h264", "h265", "av1"],
+            state="readonly", style="Dark.TCombobox", font=f(Theme.F_BODY_SM),
+        )
+        codec_combo.pack(side="right")
+        Tooltip(codec_combo,
+                "h264 is universal; h265 and av1 cut bitrate ~50% on 4K. Uses NVENC/QSV/AMF when available.")
 
         self.adaptive_batch_var = tk.BooleanVar(value=self.config.adaptive_batch)
         adaptive_toggle = ModernToggle(
@@ -4367,6 +4899,122 @@ class VideoSubtitleRemoverApp:
 
         tk.Label(time_inner, text="0 uses the full clip", font=f(Theme.F_META),
                  bg=Theme.BG_CARD, fg=Theme.TEXT_MUTED).pack(side="left", padx=(Theme.S_MD, 0))
+
+        # ---- v3.13 GUI-exposed knobs ------------------------------------
+        # Editorial: chyron vs subtitle filter + karaoke grouping
+        editorial_frame = self._create_card(self.adv_panel)
+        editorial_frame.pack(fill="x", pady=(Theme.S_MD, Theme.S_SM))
+        self._card_header(editorial_frame, "Editorial", "Filter what gets removed")
+
+        self.remove_subs_var = tk.BooleanVar(value=self.config.remove_subtitles)
+        remove_subs_toggle = ModernToggle(
+            editorial_frame,
+            text="Remove dialogue subtitles (short-lived OCR tracks)",
+            variable=self.remove_subs_var,
+        )
+        remove_subs_toggle.pack(anchor="w", padx=Theme.S_LG, pady=(Theme.S_XS, 0))
+        Tooltip(remove_subs_toggle, "Tracks the chyron classifier marks as dialogue subtitles.")
+
+        self.remove_chyrons_var = tk.BooleanVar(value=self.config.remove_chyrons)
+        remove_chyrons_toggle = ModernToggle(
+            editorial_frame,
+            text="Remove persistent text (logos, tickers, lower-thirds)",
+            variable=self.remove_chyrons_var,
+        )
+        remove_chyrons_toggle.pack(anchor="w", padx=Theme.S_LG, pady=(Theme.S_SM, 0))
+        Tooltip(remove_chyrons_toggle, "Kalman tracks lasting longer than ~3s are treated as chyrons.")
+
+        self.karaoke_grouping_var = tk.BooleanVar(value=self.config.karaoke_grouping)
+        karaoke_toggle = ModernToggle(
+            editorial_frame,
+            text="Karaoke grouping: fuse per-syllable boxes on the same line",
+            variable=self.karaoke_grouping_var,
+        )
+        karaoke_toggle.pack(anchor="w", padx=Theme.S_LG, pady=(Theme.S_SM, Theme.S_MD))
+        Tooltip(karaoke_toggle, "Stops karaoke captions leaking original text through the gaps between syllables.")
+
+        # Audio card: loudnorm target + multi-track passthrough
+        audio_frame = self._create_card(self.adv_panel)
+        audio_frame.pack(fill="x", pady=(0, Theme.S_SM))
+        self._card_header(audio_frame, "Audio", "Loudness + tracks")
+
+        self.multi_audio_var = tk.BooleanVar(value=self.config.multi_audio_passthrough)
+        multi_audio_toggle = ModernToggle(
+            audio_frame,
+            text="Pass through every audio stream (Bluray/DVD multi-track)",
+            variable=self.multi_audio_var,
+        )
+        multi_audio_toggle.pack(anchor="w", padx=Theme.S_LG, pady=(Theme.S_XS, 0))
+        Tooltip(multi_audio_toggle, "Mux every audio stream from the source. Off keeps only the first track.")
+
+        loudnorm_row = tk.Frame(audio_frame, bg=Theme.BG_CARD)
+        loudnorm_row.pack(fill="x", padx=Theme.S_LG, pady=(Theme.S_SM, Theme.S_MD))
+        tk.Label(loudnorm_row, text="EBU R128 loudness target", font=f(Theme.F_BODY_SM),
+                 bg=Theme.BG_CARD, fg=Theme.TEXT_SECONDARY).pack(side="left")
+        self.loudnorm_var = tk.StringVar(value=str(self.config.loudnorm_target or 0.0))
+        loudnorm_entry = tk.Entry(
+            loudnorm_row, width=7, bg=Theme.BG_TERTIARY,
+            fg=Theme.TEXT_PRIMARY, font=f(Theme.F_BODY_SM),
+            insertbackground=Theme.TEXT_PRIMARY,
+            highlightthickness=1,
+            highlightbackground=Theme.BORDER,
+            highlightcolor=Theme.BORDER_FOCUS,
+            relief="flat", bd=6, textvariable=self.loudnorm_var)
+        loudnorm_entry.pack(side="left", padx=(Theme.S_SM, Theme.S_MD))
+        tk.Label(loudnorm_row,
+                 text="LUFS. 0 = off. YouTube -14, Apple -16, broadcast -23.",
+                 font=f(Theme.F_META),
+                 bg=Theme.BG_CARD, fg=Theme.TEXT_MUTED).pack(side="left")
+
+        # Performance card: decode HW accel + prefetch
+        perf_frame = self._create_card(self.adv_panel)
+        perf_frame.pack(fill="x", pady=(0, Theme.S_SM))
+        self._card_header(perf_frame, "Performance", "Decode pipeline")
+
+        accel_row = tk.Frame(perf_frame, bg=Theme.BG_CARD)
+        accel_row.pack(fill="x", padx=Theme.S_LG, pady=(Theme.S_XS, 0))
+        tk.Label(accel_row, text="Hardware-decode hint", font=f(Theme.F_BODY_SM),
+                 bg=Theme.BG_CARD, fg=Theme.TEXT_SECONDARY).pack(side="left")
+        self.decode_accel_var = tk.StringVar(value=self.config.decode_hw_accel or "off")
+        accel_combo = ttk.Combobox(
+            accel_row, textvariable=self.decode_accel_var, width=10,
+            values=["off", "auto", "any", "d3d11", "vaapi", "mfx"],
+            state="readonly", style="Dark.TCombobox", font=f(Theme.F_BODY_SM),
+        )
+        accel_combo.pack(side="right")
+        Tooltip(accel_combo, "Hint for cv2.VideoCapture. Falls back to software if the HW path returns no frames.")
+
+        self.prefetch_var = tk.BooleanVar(value=self.config.prefetch_decode)
+        prefetch_toggle = ModernToggle(
+            perf_frame,
+            text="Worker-thread frame prefetch (overlap decode and inpaint)",
+            variable=self.prefetch_var,
+        )
+        prefetch_toggle.pack(anchor="w", padx=Theme.S_LG, pady=(Theme.S_SM, Theme.S_MD))
+        Tooltip(prefetch_toggle, "Decouples cv2.VideoCapture.read() from the detect+inpaint critical path. On by default.")
+
+        # Quality sheet toggle (lives under Output but kept separate so we
+        # don't disturb the existing Output card layout)
+        self.quality_sheet_var = tk.BooleanVar(value=self.config.quality_report_sheet)
+        quality_sheet_toggle = ModernToggle(
+            quality_frame,
+            text="Quality report sheet (side-by-side PNG comparison)",
+            variable=self.quality_sheet_var,
+        )
+        quality_sheet_toggle.pack(anchor="w", padx=Theme.S_LG, pady=(0, Theme.S_SM))
+        Tooltip(quality_sheet_toggle, "Renders <output>.qualitysheet.png with per-sample PSNR/SSIM. Implies the numeric report.")
+
+        # RM-96: high-contrast theme toggle. Takes effect on next launch
+        # because re-skinning every live widget mid-session would force
+        # a tree-wide redraw the design tokens were not built for.
+        self.high_contrast_var = tk.BooleanVar(value=getattr(self.config, "high_contrast", False))
+        hc_toggle = ModernToggle(
+            quality_frame,
+            text="High-contrast theme (restart required)",
+            variable=self.high_contrast_var,
+        )
+        hc_toggle.pack(anchor="w", padx=Theme.S_LG, pady=(0, Theme.S_MD))
+        Tooltip(hc_toggle, "Alternative palette tuned for low-vision users. Persists across sessions.")
 
         self._update_region_label_display()
         self._update_mode_options()
@@ -4630,6 +5278,32 @@ class VideoSubtitleRemoverApp:
         self.preview_zoom_btn.pack(side="left", padx=(Theme.S_SM, 0))
         Tooltip(self.preview_zoom_btn,
                 "Open the selected source frame in a larger viewer.")
+        # F-3: cheap inpaint preview for the first frame of the selected
+        # item. Runs detect + inpaint once and renders the result inline
+        # so users can A/B settings before committing the batch.
+        self.preview_inpaint_btn = ModernButton(
+            preview_actions,
+            text="Preview cleanup",
+            width=128,
+            command=self._open_selected_inpaint_preview,
+            style="ghost",
+            size="sm",
+        )
+        self.preview_inpaint_btn.pack(side="left", padx=(Theme.S_SM, 0))
+        Tooltip(self.preview_inpaint_btn,
+                "Run detect + inpaint on the first frame of the selected item.")
+        # RM-30: A/B flicker scrubber for completed items.
+        self.preview_ab_btn = ModernButton(
+            preview_actions,
+            text="A/B compare",
+            width=108,
+            command=self._open_ab_scrubber,
+            style="ghost",
+            size="sm",
+        )
+        self.preview_ab_btn.pack(side="left", padx=(Theme.S_SM, 0))
+        Tooltip(self.preview_ab_btn,
+                "Open a frame slider that wipes between source and cleaned output.")
 
         self._preview_label = tk.Label(self._preview_frame, bg=Theme.BG_CARD,
                                        text="", font=f(Theme.F_META),
@@ -6061,6 +6735,9 @@ class VideoSubtitleRemoverApp:
             )
         if not source_path:
             return
+        if not PIL_AVAILABLE:
+            self._update_status("Pillow required for region selector")
+            return
 
         # Resume from the user's last viewed timeline frame (if any) for this queue item
         restore_frame_idx = 0
@@ -6092,6 +6769,7 @@ class VideoSubtitleRemoverApp:
                 if frame is None:
                     logger.error("Could not read image for region selection")
                     return
+
                 restore_frame_idx = 0
         except Exception as e:
             logger.error(f"Region selector error: {e}")
@@ -6905,6 +7583,212 @@ class VideoSubtitleRemoverApp:
         except OSError:
             return 0
 
+    def _open_per_file_overrides(self, item_id: str):
+        """RM-29: themed popover that edits a single queue item's
+        ProcessingConfig without touching the global UI state.
+
+        Only the most-asked fields are surfaced (mode, language,
+        sensitivity, output codec). The rest of the config carries over
+        from the snapshot taken when the item was queued.
+        """
+        item = next((it for it in self.queue if it.id == item_id), None)
+        if item is None or item.status != ProcessingStatus.IDLE:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Override settings: {Path(item.file_path).name}")
+        dialog.configure(bg=Theme.BG_OVERLAY)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        outer = tk.Frame(dialog, bg=Theme.BORDER, padx=1, pady=1)
+        outer.pack()
+        body = tk.Frame(outer, bg=Theme.BG_SECONDARY)
+        body.pack()
+
+        content = tk.Frame(body, bg=Theme.BG_SECONDARY)
+        content.pack(padx=24, pady=(20, 12))
+
+        tk.Label(content, text="Per-file overrides",
+                 font=f(Theme.F_HEADING, "bold"),
+                 bg=Theme.BG_SECONDARY, fg=Theme.TEXT_PRIMARY).pack(anchor="w")
+        tk.Label(content,
+                 text="These apply to this queued item only and survive a global settings change.",
+                 font=f(Theme.F_BODY_SM),
+                 bg=Theme.BG_SECONDARY, fg=Theme.TEXT_SECONDARY,
+                 wraplength=380, justify="left").pack(anchor="w", pady=(2, Theme.S_LG))
+
+        # Mode picker.
+        mode_var = tk.StringVar(value=item.config.mode.value)
+        tk.Label(content, text="Mode", font=f(Theme.F_BODY_SM),
+                 bg=Theme.BG_SECONDARY, fg=Theme.TEXT_SECONDARY).pack(anchor="w")
+        mode_picker = SegmentedPicker(
+            content,
+            options=[(m.value, m.value) for m in InpaintMode],
+            value=mode_var.get(),
+            command=lambda v: mode_var.set(v),
+            bg=Theme.BG_SECONDARY,
+        )
+        mode_picker.pack(fill="x", pady=(2, Theme.S_MD))
+
+        # Detection language.
+        lang_row = tk.Frame(content, bg=Theme.BG_SECONDARY)
+        lang_row.pack(fill="x", pady=(0, Theme.S_SM))
+        tk.Label(lang_row, text="Subtitle language", font=f(Theme.F_BODY_SM),
+                 bg=Theme.BG_SECONDARY, fg=Theme.TEXT_SECONDARY).pack(side="left")
+        lang_codes = [code for code, _ in self._lang_display]
+        lang_var = tk.StringVar(value=item.config.detection_lang)
+        lang_combo = ttk.Combobox(
+            lang_row, textvariable=lang_var, width=18,
+            values=self._lang_labels,
+            state="readonly", style="Dark.TCombobox", font=f(Theme.F_BODY_SM),
+        )
+        # Match the friendly label for the current code.
+        for label, (code, _) in zip(self._lang_labels, self._lang_display):
+            if code == lang_var.get():
+                lang_combo.set(label)
+                break
+        lang_combo.pack(side="right")
+
+        # Sensitivity slider (1-9 maps to 0.1-0.9).
+        sens_row = tk.Frame(content, bg=Theme.BG_SECONDARY)
+        sens_row.pack(fill="x", pady=(Theme.S_SM, Theme.S_SM))
+        sens_var = tk.IntVar(value=int(round(item.config.detection_threshold * 100)))
+        tk.Label(sens_row, text="Sensitivity", font=f(Theme.F_BODY_SM),
+                 bg=Theme.BG_SECONDARY, fg=Theme.TEXT_SECONDARY).pack(side="left")
+        sens_label = tk.Label(sens_row, text=f"{sens_var.get()}%",
+                              font=f(Theme.F_BODY_SM, "bold"),
+                              bg=Theme.BG_SECONDARY, fg=Theme.BLUE_PRIMARY)
+        sens_label.pack(side="right")
+
+        def _on_sens(value):
+            try:
+                sens_var.set(int(value))
+                sens_label.config(text=f"{int(value)}%")
+            except (TypeError, ValueError):
+                pass
+
+        sens_slider = tk.Scale(
+            content, from_=10, to=90, orient="horizontal",
+            command=_on_sens, showvalue=False, length=380,
+            bg=Theme.BG_SECONDARY, fg=Theme.TEXT_PRIMARY,
+            troughcolor=Theme.BG_TERTIARY,
+            activebackground=Theme.BLUE_PRIMARY,
+            highlightthickness=0,
+        )
+        sens_slider.set(sens_var.get())
+        sens_slider.pack(fill="x", pady=(0, Theme.S_MD))
+
+        # Output codec.
+        codec_row = tk.Frame(content, bg=Theme.BG_SECONDARY)
+        codec_row.pack(fill="x", pady=(0, Theme.S_SM))
+        tk.Label(codec_row, text="Output codec", font=f(Theme.F_BODY_SM),
+                 bg=Theme.BG_SECONDARY, fg=Theme.TEXT_SECONDARY).pack(side="left")
+        codec_var = tk.StringVar(value=getattr(item.config, "output_codec", "h264"))
+        ttk.Combobox(
+            codec_row, textvariable=codec_var, width=8,
+            values=["h264", "h265", "av1"],
+            state="readonly", style="Dark.TCombobox", font=f(Theme.F_BODY_SM),
+        ).pack(side="right")
+
+        # Action buttons.
+        actions = tk.Frame(body, bg=Theme.BG_CARD)
+        actions.pack(fill="x")
+        actions_inner = tk.Frame(actions, bg=Theme.BG_CARD)
+        actions_inner.pack(side="right", padx=16, pady=14)
+
+        def _save():
+            try:
+                item.config.mode = InpaintMode(mode_var.get())
+            except ValueError:
+                pass
+            label = lang_combo.get()
+            new_code = self._lang_by_label.get(label, item.config.detection_lang)
+            item.config.detection_lang = new_code
+            item.config.detection_threshold = sens_var.get() / 100.0
+            item.config.output_codec = codec_var.get()
+            item.config.normalized()
+            if item.id in self.queue_widgets:
+                self.queue_widgets[item.id].update_item(item)
+            self._update_status(
+                f"Overrides saved for {Path(item.file_path).name}",
+                "success",
+            )
+            dialog.destroy()
+
+        ModernButton(actions_inner, text="Cancel", command=dialog.destroy,
+                     style="ghost", size="md", width=96).pack(side="left")
+        ModernButton(actions_inner, text="Save", command=_save,
+                     style="primary", size="md", width=96).pack(
+                         side="left", padx=(Theme.S_SM, 0))
+
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.update_idletasks()
+        try:
+            px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
+            pw, ph = self.root.winfo_width(), self.root.winfo_height()
+            dw, dh = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+            dialog.geometry(f"+{px + (pw - dw) // 2}+{py + (ph - dh) // 3}")
+        except Exception:
+            pass
+
+    def _cancel_queue_item(self, item_id: str):
+        """F-7: per-item cancellation. Sets the QueueItem's cancel flag;
+        _process_item's progress callback raises InterruptedError next
+        time it fires so the worker drops this file and moves on to the
+        next one. The global cancel_event stays untouched so the rest
+        of the batch survives."""
+        with self.queue_lock:
+            item = next((it for it in self.queue if it.id == item_id), None)
+        if item is None:
+            return
+        if item.status not in (ProcessingStatus.LOADING,
+                                ProcessingStatus.DETECTING,
+                                ProcessingStatus.PROCESSING,
+                                ProcessingStatus.MERGING):
+            self._update_status("That item is not running", "warning")
+            return
+        item.cancel_requested = True
+        self._update_status(
+            f"Cancelling {Path(item.file_path).name}", "warning", toast=True,
+        )
+
+    def _repeat_item_with_settings(self, item_id: str):
+        """RM-28: snapshot the named item's config and re-queue the same
+        source file with a fresh IDLE entry. Lets users re-run a clip
+        with exactly the per-file settings that already worked once,
+        even after the global UI state has changed."""
+        with self.queue_lock:
+            template = next((it for it in self.queue if it.id == item_id), None)
+        if template is None:
+            self._update_status("Item not found in queue", "warning")
+            return
+        # Snapshot via to_dict / from_dict so any future field churn does
+        # not need an explicit copy update here.
+        snapshot = ProcessingConfig.from_dict(template.config.to_dict())
+        # Build a fresh output path (unique vs the original).
+        desired = self._suggest_output_path(template.file_path)
+        new_item = QueueItem(
+            id=str(uuid.uuid4()),
+            file_path=template.file_path,
+            output_path=str(desired),
+            config=snapshot,
+            output_path_locked=False,
+            status=ProcessingStatus.IDLE,
+            progress=0.0,
+            message="Ready to process",
+        )
+        with self.queue_lock:
+            self.queue.append(new_item)
+        self._update_queue_display()
+        self._refresh_action_states()
+        self._update_status(
+            f"Re-queued {Path(template.file_path).name} with the same settings",
+            "info", toast=True,
+        )
+
     def _rename_output_for(self, item_id: str):
         """Open a file picker to customize the output path of a queued item.
 
@@ -7047,7 +7931,10 @@ class VideoSubtitleRemoverApp:
                 if item.id not in self.queue_widgets:
                     widget = QueueItemWidget(self.queue_frame, item, self._remove_from_queue,
                                              on_select=self._show_preview,
-                                             on_rename=self._rename_output_for)
+                                             on_rename=self._rename_output_for,
+                                             on_repeat=self._repeat_item_with_settings,
+                                             on_cancel_item=self._cancel_queue_item,
+                                             on_override=self._open_per_file_overrides)
                     widget.pack(fill="x", pady=(0, 8))
                     self.queue_widgets[item.id] = widget
                     # Forward mousewheel to queue canvas
@@ -7427,6 +8314,12 @@ class VideoSubtitleRemoverApp:
         self.start_btn.icon = "x"
         self.start_btn.set_text("Stop batch")
         self._batch_times = []
+        # F-9: probe the first queued video so the very first ETA tick
+        # has a real number instead of "" until the first item finishes.
+        try:
+            self._probe_eta_seconds = self._probe_batch_eta()
+        except Exception:
+            self._probe_eta_seconds = 0.0
         self._batch_started_at = datetime.now()
         self._refresh_action_states()
         self._update_status("Batch processing started", "info")
@@ -7536,6 +8429,7 @@ class VideoSubtitleRemoverApp:
             item.message = "Initializing..."
             item.error = None
             item.quality_report = None
+            item.cancel_requested = False  # F-7 reset on fresh attempt
             self._update_item_display(item)
 
             from backend.processor import (
@@ -7568,7 +8462,8 @@ class VideoSubtitleRemoverApp:
 
             backend_mode = mode_map.get(item.config.mode.value, BackendInpaintMode.STTN)
             lang = getattr(item.config, 'detection_lang', 'en')
-            cache_key = (backend_mode, device, lang)
+            vertical = bool(getattr(item.config, 'detection_vertical', False))
+            cache_key = (backend_mode, device, lang, vertical)
 
             backend_config = BackendConfig(
                 mode=backend_mode,
@@ -7582,6 +8477,15 @@ class VideoSubtitleRemoverApp:
                 output_quality=item.config.output_quality,
                 detection_lang=lang,
                 detection_threshold=getattr(item.config, 'detection_threshold', 0.5),
+                detection_vertical=getattr(item.config, 'detection_vertical', False),
+                whisper_fallback=getattr(item.config, 'whisper_fallback', False),
+                whisper_model_size=getattr(item.config, 'whisper_model_size', 'tiny'),
+                upscale_factor=getattr(item.config, 'upscale_factor', 0),
+                film_grain_strength=getattr(item.config, 'film_grain_strength', 0.0),
+                swinir_restore=getattr(item.config, 'swinir_restore', False),
+                seedvr2_restore=getattr(item.config, 'seedvr2_restore', False),
+                preserve_color_metadata=getattr(item.config, 'preserve_color_metadata', True),
+                nle_sidecar=getattr(item.config, 'nle_sidecar', 'off'),
                 subtitle_area=item.config.subtitle_area,
                 time_start=getattr(item.config, 'time_start', 0.0),
                 time_end=getattr(item.config, 'time_end', 0.0),
@@ -7594,6 +8498,10 @@ class VideoSubtitleRemoverApp:
                 tbe_flow_warp=getattr(item.config, 'tbe_flow_warp', False),
                 tbe_scene_cut_split=getattr(item.config, 'tbe_scene_cut_split', True),
                 tbe_scene_cut_threshold=getattr(item.config, 'tbe_scene_cut_threshold', 0.35),
+                tbe_scene_cut_use_pyscenedetect=getattr(item.config, 'tbe_scene_cut_use_pyscenedetect', False),
+                tbe_scene_cut_use_transnetv2=getattr(item.config, 'tbe_scene_cut_use_transnetv2', False),
+                detection_denoise=getattr(item.config, 'detection_denoise', False),
+                sam2_refine=getattr(item.config, 'sam2_refine', False),
                 edge_ring_px=getattr(item.config, 'edge_ring_px', 2),
                 subtitle_areas=getattr(item.config, 'subtitle_areas', None),
                 sam_mask_path=getattr(item.config, 'sam_mask_path', None),
@@ -7613,6 +8521,22 @@ class VideoSubtitleRemoverApp:
                 colour_tune_enable=getattr(item.config, 'colour_tune_enable', False),
                 colour_tune_tolerance=getattr(item.config, 'colour_tune_tolerance', 25),
                 use_hw_encode=getattr(item.config, 'use_hw_encode', True),
+                output_codec=getattr(item.config, 'output_codec', 'h264'),
+                # v3.13 GUI-exposed fields: previously CLI-only, now plumbed
+                # through so a GUI user can drive every backend feature.
+                loudnorm_target=getattr(item.config, 'loudnorm_target', 0.0),
+                multi_audio_passthrough=getattr(item.config, 'multi_audio_passthrough', True),
+                decode_hw_accel=getattr(item.config, 'decode_hw_accel', 'off'),
+                prefetch_decode=getattr(item.config, 'prefetch_decode', True),
+                prefetch_queue_size=getattr(item.config, 'prefetch_queue_size', 0),
+                input_fps=getattr(item.config, 'input_fps', 24.0),
+                quality_report_sheet=getattr(item.config, 'quality_report_sheet', False),
+                remove_subtitles=getattr(item.config, 'remove_subtitles', True),
+                remove_chyrons=getattr(item.config, 'remove_chyrons', True),
+                chyron_min_hits=getattr(item.config, 'chyron_min_hits', 90),
+                karaoke_grouping=getattr(item.config, 'karaoke_grouping', False),
+                karaoke_x_gap_px=getattr(item.config, 'karaoke_x_gap_px', 20),
+                karaoke_y_overlap=getattr(item.config, 'karaoke_y_overlap', 0.5),
             )
 
             # Auto subtitle-band detection -- run before the main pass so we
@@ -7635,10 +8559,14 @@ class VideoSubtitleRemoverApp:
                     logger.warning(f"Auto-band detection failed: {exc}")
 
             # Reuse cached remover if mode/device/lang match (avoids reloading
-            # OCR models and re-probing HW encoders for every queue item)
+            # OCR models and re-probing HW encoders for every queue item).
+            # The constructor normalises the config; on hot-swap we re-run
+            # normalisation explicitly so a NaN/inf/out-of-range value from a
+            # bad per-item override cannot reach the pipeline.
             if self._cached_remover is not None and self._cached_remover_key == cache_key:
                 remover = self._cached_remover
-                remover.config = backend_config
+                from backend.processor import normalize_processing_config as _normalize_backend_config
+                remover.config = _normalize_backend_config(backend_config)
             else:
                 remover = BackendRemover(backend_config)
                 self._cached_remover = remover
@@ -7649,6 +8577,12 @@ class VideoSubtitleRemoverApp:
             def on_progress(progress: float, message: str):
                 if self.cancel_event.is_set():
                     raise InterruptedError("Processing cancelled")
+                # F-7: per-item cancel raises the same exception so
+                # process_video bails on THIS file; the outer
+                # _process_queue loop then advances to the next item
+                # because cancel_event was never set.
+                if getattr(item, "cancel_requested", False):
+                    raise InterruptedError("Item cancelled by user")
                 # Map backend progress to GUI status
                 if progress < 0.3:
                     item.status = ProcessingStatus.DETECTING
@@ -7667,10 +8601,20 @@ class VideoSubtitleRemoverApp:
             # Live preview: pipe the latest inpainted frame into the preview
             # pane. The backend emits frames on its worker thread, so we
             # marshal to the Tk main loop via root.after.
+            #
+            # EI-4: also throttle on wall-clock so the worker does not
+            # queue PIL conversions faster than the Tk thread can absorb
+            # ImageTk.PhotoImage calls (~50 ms on 4K). The receiver still
+            # throttles to ~15 FPS, but throttling in the worker too
+            # avoids burning CPU on conversions that get dropped.
+            preview_throttle_state = {"last_ts": 0.0}
             def on_preview_frame(frame, cur_idx, total):
                 if self.cancel_event.is_set():
                     return
-                # Down-sample into the PIL buffer size the preview pane uses
+                now = time.monotonic()
+                if (now - preview_throttle_state["last_ts"]) < (1.0 / 15.0):
+                    return
+                preview_throttle_state["last_ts"] = now
                 try:
                     max_w, max_h = 520, 320
                     h, w = frame.shape[:2]
@@ -7761,15 +8705,87 @@ class VideoSubtitleRemoverApp:
             self._taskbar = None
 
     def _compute_eta(self, current: int, total: int) -> str:
-        """Estimate time-remaining based on rolling average per-item time."""
+        """Estimate time-remaining based on rolling average per-item time.
+
+        F-9: when no items have completed yet we fall back to the
+        pre-batch probe estimate (`_probe_eta_seconds`) so users get a
+        sensible "about X left" line from the very first frame instead
+        of an empty string until the first item finishes.
+        """
         remaining = total - current
-        if remaining <= 0 or not self._batch_times:
+        if remaining <= 0:
             return ""
-        # Use a recency-weighted average of the last few items
-        recent = self._batch_times[-5:]
-        avg = sum(recent) / len(recent)
-        eta_seconds = avg * remaining
-        return format_time(eta_seconds)
+        if self._batch_times:
+            recent = self._batch_times[-5:]
+            avg = sum(recent) / len(recent)
+            eta_seconds = avg * remaining
+            return format_time(eta_seconds)
+        probe = getattr(self, "_probe_eta_seconds", 0.0) or 0.0
+        if probe > 0:
+            return format_time(probe * remaining) + " (estimated)"
+        return ""
+
+    def _probe_batch_eta(self) -> float:
+        """F-9: cheap pre-batch ETA probe. Reads a 30-frame slice from
+        the first queued video, runs detect + inpaint on that slice,
+        scales the wall-time by the video's frame count divided by the
+        probe size. Returns the estimated per-item seconds (or 0 if the
+        probe can't run -- e.g. only images in the queue).
+
+        Runs synchronously off the main thread so the GUI stays
+        responsive; we always cap the probe at ~10 s so launch latency
+        stays low even on slow CPUs.
+        """
+        first_video = None
+        for item in self.queue:
+            if is_video_file(item.file_path) and item.status == ProcessingStatus.IDLE:
+                first_video = item
+                break
+        if first_video is None:
+            return 0.0
+        try:
+            import cv2 as _cv2
+            cap = _cv2.VideoCapture(first_video.file_path)
+            try:
+                if not cap.isOpened():
+                    return 0.0
+                total_frames = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT)) or 1
+                fps = cap.get(_cv2.CAP_PROP_FPS) or 30.0
+                if fps <= 0:
+                    fps = 30.0
+                duration = total_frames / fps
+                probe_frames = min(30, total_frames)
+                if probe_frames <= 0:
+                    return 0.0
+                from backend.processor import SubtitleDetector
+                detector = self._preview_detector
+                lang = first_video.config.detection_lang or "en"
+                if detector is None or self._preview_detector_lang != lang:
+                    detector = SubtitleDetector(lang=lang)
+                    self._preview_detector = detector
+                    self._preview_detector_lang = lang
+                threshold = getattr(first_video.config, "detection_threshold", 0.5)
+                t0 = time.monotonic()
+                for _ in range(probe_frames):
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    detector.detect(frame, threshold)
+                elapsed = time.monotonic() - t0
+            finally:
+                cap.release()
+        except Exception as exc:
+            logger.debug(f"Pre-batch ETA probe failed: {exc}")
+            return 0.0
+        if elapsed <= 0 or probe_frames <= 0:
+            return 0.0
+        # Scale to the full video duration. Add a fudge factor for the
+        # inpaint pass and ffmpeg mux which the detect-only probe does
+        # not see. 1.8x leaves room for slower inpainters without
+        # over-estimating to the point of being useless.
+        per_frame_detect = elapsed / probe_frames
+        est_per_video = per_frame_detect * total_frames * 1.8 + max(2.0, duration * 0.05)
+        return est_per_video
 
     def _update_batch_progress(self, current: int, total: int):
         """Update the overall batch progress bar, percent label, and title."""
@@ -7890,6 +8906,20 @@ class VideoSubtitleRemoverApp:
 
     def _notify_completion(self, complete: int, errors: int):
         """Flash taskbar + play sound when batch processing finishes."""
+        # RM-95: screen-reader announcement so NVDA / Narrator users
+        # learn the batch finished without polling the activity log.
+        try:
+            from backend.a11y import announce
+            if errors == 0:
+                announce(f"Batch complete. {complete} items processed.")
+            else:
+                announce(
+                    f"Batch finished with {errors} errors. "
+                    f"{complete} items processed.",
+                    importance="high",
+                )
+        except Exception:
+            pass
         # Flash the taskbar icon to draw attention
         try:
             import ctypes
