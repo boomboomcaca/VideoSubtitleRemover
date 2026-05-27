@@ -31,6 +31,9 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+import sys
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +51,7 @@ def _probe_codec_for_log(path: str) -> Optional[str]:
             '-show_entries', 'stream=codec_name,width,height,r_frame_rate',
             '-of', 'csv=p=0', path,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW)
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip().splitlines()[0]
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -64,7 +67,7 @@ def _probe_audio_stream_count(path: str) -> int:
             '-show_entries', 'stream=index',
             '-of', 'csv=p=0', path,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20, creationflags=_NO_WINDOW)
         if result.returncode == 0:
             lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
             return max(1, len(lines))
@@ -80,7 +83,7 @@ def _probe_duration_seconds(path: str) -> float:
             'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1', path,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20, creationflags=_NO_WINDOW)
         if result.returncode == 0:
             return max(0.0, float(result.stdout.strip()))
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
@@ -106,7 +109,7 @@ def _probe_keyframe_indices(video_path: str) -> Optional[set]:
             '-show_entries', 'frame=key_frame',
             '-of', 'csv=print_section=0', video_path,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, creationflags=_NO_WINDOW)
         if result.returncode != 0:
             if result.stderr:
                 logger.debug(f"ffprobe keyframe scan stderr: {result.stderr.strip()[:400]}")
@@ -141,7 +144,7 @@ def _probe_is_interlaced(video_path: str) -> bool:
             'ffmpeg', '-hide_banner', '-nostats', '-i', video_path,
             '-vf', 'idet', '-frames:v', '200', '-an', '-f', 'null', '-',
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, creationflags=_NO_WINDOW)
         stderr = result.stderr
         import re as _re
         m = _re.search(r'Multi frame detection:.*TFF:\s*(\d+).*BFF:\s*(\d+).*Progressive:\s*(\d+)',
@@ -165,7 +168,7 @@ def _deinterlace_to_temp(src: str, temp_dir: str) -> str:
         '-c:a', 'copy', dst,
     ]
     timeout = _ffmpeg_subprocess_timeout(_probe_duration_seconds(src))
-    subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
+    subprocess.run(cmd, check=True, capture_output=True, timeout=timeout, creationflags=_NO_WINDOW)
     return dst
 
 
@@ -492,6 +495,7 @@ class _LosslessIntermediateWriter:
             self._proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                creationflags=_NO_WINDOW,
             )
             self._opened = True
             self._lossless = True

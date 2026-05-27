@@ -27,9 +27,12 @@ def _detect_hw_encoder(codec: str = "h264") -> Optional[str]:
         "av1":  ("av1_nvenc",  "av1_qsv",  "av1_amf"),
     }.get(codec, ("h264_nvenc", "h264_qsv", "h264_amf"))
     try:
+        import sys
+        _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         result = subprocess.run(
             ['ffmpeg', '-hide_banner', '-encoders'],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=10,
+            creationflags=_NO_WINDOW
         )
         for encoder in family:
             if encoder in result.stdout:

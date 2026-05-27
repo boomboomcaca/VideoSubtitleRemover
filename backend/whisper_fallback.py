@@ -82,6 +82,8 @@ def extract_audio_to_temp(video_path: str, temp_dir: str) -> Optional[str]:
     """
     import shutil
     import subprocess
+    import sys
+    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     if shutil.which("ffmpeg") is None:
         logger.info("ffmpeg not on PATH; cannot extract audio for Whisper")
         return None
@@ -92,7 +94,7 @@ def extract_audio_to_temp(video_path: str, temp_dir: str) -> Optional[str]:
         "-acodec", "pcm_s16le", dst,
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+        subprocess.run(cmd, check=True, capture_output=True, timeout=600, creationflags=_NO_WINDOW)
     except subprocess.CalledProcessError as exc:
         logger.info(f"Audio extraction failed (no stream?): {exc}")
         return None

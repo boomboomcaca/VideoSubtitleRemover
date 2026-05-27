@@ -29,10 +29,13 @@ import json
 import logging
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 
 @dataclass
@@ -75,7 +78,7 @@ def probe_color_metadata(path: str) -> Optional[ColorMetadata]:
             "ffprobe", "-v", "error", "-select_streams", "v:0",
             "-show_streams", "-of", "json", path,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20, creationflags=_NO_WINDOW)
         if result.returncode != 0 or not result.stdout.strip():
             return None
         payload = json.loads(result.stdout)

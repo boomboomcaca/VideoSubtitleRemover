@@ -19,6 +19,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +27,8 @@ import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 
 def realesrgan_upscale(input_path: str, output_path: str,
@@ -48,7 +51,7 @@ def realesrgan_upscale(input_path: str, output_path: str,
                 "-s", str(scale),
                 "-n", model_name,
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, creationflags=_NO_WINDOW)
             if result.returncode == 0 and Path(output_path).is_file():
                 logger.info(f"Real-ESRGAN upscaled to {output_path}")
                 return output_path
@@ -96,7 +99,7 @@ def seedvr2_restore(input_path: str, output_path: str,
     if cmd_env:
         try:
             cmd = cmd_env.split() + ["-i", input_path, "-o", output_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400, creationflags=_NO_WINDOW)
             if result.returncode == 0 and Path(output_path).is_file():
                 logger.info(f"SeedVR2 restoration complete via {cmd_env}")
                 return output_path
@@ -147,7 +150,7 @@ def swinir_restore(input_path: str, output_path: str,
         cmd = [binary, "-i", input_path, "-o", output_path, "-s", str(scale)]
         if "swinir" in binary and task:
             cmd += ["-t", task]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200, creationflags=_NO_WINDOW)
         if result.returncode == 0 and Path(output_path).is_file():
             logger.info(f"SwinIR restoration complete ({binary})")
             return output_path
@@ -188,7 +191,7 @@ def add_film_grain(input_path: str, output_path: str,
         "-c:a", "copy", output_path,
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=7200)
+        subprocess.run(cmd, check=True, capture_output=True, timeout=7200, creationflags=_NO_WINDOW)
         return output_path
     except subprocess.CalledProcessError as exc:
         logger.warning(

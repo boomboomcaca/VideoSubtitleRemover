@@ -62,6 +62,8 @@ def maybe_compile_engine(onnx_path: str, precision: str = "fp16") -> Optional[Pa
         )
         return None
     import subprocess
+    import sys
+    _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     cmd = [
         "polygraphy", "convert", onnx_path,
         "--convert-to", "trt",
@@ -72,7 +74,7 @@ def maybe_compile_engine(onnx_path: str, precision: str = "fp16") -> Optional[Pa
     elif precision == "int8":
         cmd += ["--int8"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, creationflags=_NO_WINDOW)
         if result.returncode == 0 and cached.is_file():
             logger.info(f"TensorRT engine compiled: {cached}")
             return cached

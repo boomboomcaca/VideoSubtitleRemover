@@ -41,6 +41,8 @@ from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+
 # RFP-L-1 re-exports. Anything that used to be defined in this module
 # but moved during the split is re-imported here so existing callers
 # (`from backend.processor import _open_capture`) keep working.
@@ -1863,7 +1865,7 @@ class SubtitleRemover:
             cmd += self._get_encode_args()
             cmd += ['-an', str(temp_output)]
             timeout = _ffmpeg_subprocess_timeout(_probe_duration_seconds(source))
-            subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
+            subprocess.run(cmd, check=True, capture_output=True, timeout=timeout, creationflags=_NO_WINDOW)
             _promote_temp_output(temp_output, output)
         except subprocess.CalledProcessError as e:
             if self._hw_encoder:
@@ -1948,7 +1950,7 @@ class SubtitleRemover:
             # input so multi-hour videos do not silently lose audio when the
             # mux pass takes longer than the legacy 10-minute fixed budget.
             timeout = _ffmpeg_subprocess_timeout(_probe_duration_seconds(original))
-            subprocess.run(cmd, check=True, capture_output=True, timeout=timeout)
+            subprocess.run(cmd, check=True, capture_output=True, timeout=timeout, creationflags=_NO_WINDOW)
             _promote_temp_output(temp_output, output)
             encoder_name = self._hw_encoder or 'libx264'
             logger.info(f"Audio merged successfully (encoder: {encoder_name})")

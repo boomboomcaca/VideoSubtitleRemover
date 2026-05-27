@@ -18,10 +18,13 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 
 def _proxy_cache_dir() -> Path:
@@ -61,7 +64,7 @@ def ensure_proxy(source_path: str, target_height: int = 480,
         "-an", str(cache),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, creationflags=_NO_WINDOW)
         if result.returncode == 0 and cache.is_file():
             logger.info(f"Proxy cached at {cache}")
             return str(cache)
