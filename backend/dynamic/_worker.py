@@ -828,11 +828,34 @@ def _compute_bbox(
     h = y1 - y0
     w_aligned = (w // align) * align
     h_aligned = (h // align) * align
-    # If the snap shrank us, try to grow by shifting x0/y0 left/up
-    if w_aligned < w and x0 + w_aligned + align <= frame_w:
-        w_aligned += align
-    if h_aligned < h and y0 + h_aligned + align <= frame_h:
-        h_aligned += align
+    # If the snap shrank us, try to grow:
+    #   1) extend right/down if there's frame room
+    #   2) otherwise shift x0/y0 left/up (handles bbox touching the right
+    #      or bottom frame edge — e.g. a HUD element pinned to a corner.
+    #      Without this branch the residue strip at the edge is never
+    #      passed to ProPainter and stays visible in the final overlay.)
+    if w_aligned < w:
+        if x0 + w_aligned + align <= frame_w:
+            w_aligned += align
+        elif x0 >= align:
+            x0 -= align
+            w_aligned += align
+    if h_aligned < h:
+        if y0 + h_aligned + align <= frame_h:
+            h_aligned += align
+        elif y0 >= align:
+            y0 -= align
+            h_aligned += align
+
+    # Slide-to-edge: if the original mask reached the right/bottom frame
+    # edge but the aligned crop still falls short of it, slide the crop
+    # so it touches that edge. Otherwise a 1..(align-1) px residue strip
+    # at the edge is never fed to ProPainter and stays visible in the
+    # composited output.
+    if max_x + 1 >= frame_w and x0 + w_aligned < frame_w and w_aligned <= frame_w:
+        x0 = frame_w - w_aligned
+    if max_y + 1 >= frame_h and y0 + h_aligned < frame_h and h_aligned <= frame_h:
+        y0 = frame_h - h_aligned
 
     log.info(
         "Mask bbox: union=(%d,%d)-(%d,%d), padded+aligned=%dx%d at (%d,%d) "
