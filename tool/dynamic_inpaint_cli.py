@@ -158,7 +158,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         "when --auto-crop is on (default 96). More "
                         "padding = more surrounding texture for "
                         "ProPainter, but larger crop and slower run.")
-    p.add_argument("--mask-dilate", type=int, default=12,
+    p.add_argument("--mask-dilate", type=int, default=13,
                    help="Pixels to grow each mask outward before saving "
                         "(default 12). 0 disables. Increases to 4-8 px "
                         "eliminate the faint outline ring that sharp-edge "
