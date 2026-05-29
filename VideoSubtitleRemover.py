@@ -6383,7 +6383,7 @@ class VideoSubtitleRemoverApp:
                     auto_crop=True, fp16=True,
                     subvideo_length=160,
                     crop_padding=96,      # Increased for better watermark coverage
-                    mask_dilate=12,       # Increased for anti-aliased/outline edges
+                    mask_dilate=13,       # Increased for anti-aliased/outline edges
                     progress_callback=_set_progress,
                 )
                 self.root.after(0, lambda: _done(result.output_video))
